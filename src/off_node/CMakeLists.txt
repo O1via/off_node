@@ -196,6 +196,7 @@ target_link_libraries(gp_transition_data_collector
 ## in contrast to setup.py, you can choose the destination
 catkin_install_python(PROGRAMS
   scripts/rtmpc_gazebo_node.py
+  scripts/plot_rtmpc_diag.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -31,8 +31,8 @@ pre_align_force_start_on_timeout: false
 
 # Line-entry stage: hover at staging point then fly straight to circle start with target speed
 line_entry_enable: true
-line_entry_staging_offset_m: 2.0
-line_entry_hold_sec: 1.0
+line_entry_staging_offset_m: 4.0
+line_entry_hold_sec: 0.1
 line_entry_timeout_sec: 30.0
 line_entry_force_start_on_timeout: false
 line_entry_pos_tol_n_m: 0.15
@@ -73,3 +73,10 @@ pose_topic: mavros/local_position/pose
 vel_topic: mavros/local_position/velocity_local
 state_topic: mavros/state
 att_sp_topic: mavros/setpoint_raw/attitude
+
+# Diagnostics
+# write phase switch diagnostics to CSV for offline plotting
+# (line_entry criteria: pos/vel/att/hold)
+diag_enable: true
+diag_csv_path: /home/zxy/off_node/src/off_node/diag_outputs/rtmpc_diag.csv
+diag_log_hz: 10.0

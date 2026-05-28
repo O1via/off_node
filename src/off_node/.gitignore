@@ -1,0 +1,7 @@
+# Runtime diagnostics artifacts
+diag_outputs/*.csv
+diag_outputs/*.png
+
+# Python cache
+__pycache__/
+*.pyc

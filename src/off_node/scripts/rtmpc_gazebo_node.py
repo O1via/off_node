@@ -15,6 +15,7 @@ Main loop:
 4) publish attitude+thrust command to UAV
 """
 
+import csv
 import math
 import sys
 from pathlib import Path
@@ -134,6 +135,11 @@ class RtmpcGazeboNode:
         self.state_topic = str(rospy.get_param("~state_topic", "mavros/state"))
         self.att_sp_topic = str(rospy.get_param("~att_sp_topic", "mavros/setpoint_raw/attitude"))
 
+        # Diagnostics
+        self.diag_enable = bool(rospy.get_param("~diag_enable", True))
+        self.diag_csv_path = str(rospy.get_param("~diag_csv_path", "/tmp/rtmpc_diag.csv"))
+        self.diag_log_hz = float(rospy.get_param("~diag_log_hz", 10.0))
+
         # --------------------- ROS io ---------------------
         self.current_state: Optional[State] = None
         self.pose_msg: Optional[PoseStamped] = None
@@ -165,6 +171,7 @@ class RtmpcGazeboNode:
         self.gp_model: Optional[VelocityResidualGP] = None
         self._prepare_tube_and_bounds()
         self._prepare_reference()
+        self._init_diag_logger()
 
         rospy.loginfo("[rtmpc_gz] init done")
         rospy.loginfo("[rtmpc_gz] dt=%.3f, horizon=%d, radius=%.2f, period=%d", self.dt, self.horizon,
@@ -278,6 +285,124 @@ class RtmpcGazeboNode:
 
     def _vel_cb(self, msg: TwistStamped) -> None:
         self.vel_msg = msg
+
+    def _init_diag_logger(self) -> None:
+        self._diag_file = None
+        self._diag_writer = None
+        self._diag_last_log_sec = None
+
+        if not self.diag_enable:
+            return
+
+        diag_path = Path(self.diag_csv_path).expanduser()
+        diag_path.parent.mkdir(parents=True, exist_ok=True)
+        self._diag_file = diag_path.open("w", newline="")
+        self._diag_writer = csv.writer(self._diag_file)
+        self._diag_writer.writerow(
+            [
+                "t",
+                "phase",
+                "pn", "pe", "pd", "vn", "ve", "vd", "phi", "theta",
+                "target_pn", "target_pe", "target_pd",
+                "target_vn", "target_ve", "target_vd",
+                "pos_err_n", "pos_err_e", "pos_err_d",
+                "vel_err_n", "vel_err_e", "vel_err_d",
+                "pos_ok", "vel_ok", "att_ok",
+                "hold_elapsed", "hold_required",
+                "u_dT", "u_phi", "u_theta",
+                "fail_reason",
+            ]
+        )
+        self._diag_file.flush()
+        rospy.on_shutdown(self._close_diag_logger)
+        rospy.loginfo("[rtmpc_gz] diag enabled: %s", str(diag_path))
+
+    def _close_diag_logger(self) -> None:
+        diag_file = getattr(self, "_diag_file", None)
+        if diag_file is not None:
+            try:
+                diag_file.flush()
+            except Exception:
+                pass
+            try:
+                diag_file.close()
+            except Exception:
+                pass
+            self._diag_file = None
+
+    @staticmethod
+    def _diag_fail_reason(pos_ok: bool, vel_ok: bool, att_ok: bool) -> str:
+        reasons = []
+        if not pos_ok:
+            reasons.append("pos")
+        if not vel_ok:
+            reasons.append("vel")
+        if not att_ok:
+            reasons.append("att")
+        return "ok" if not reasons else "+".join(reasons)
+
+    def _diag_log(
+        self,
+        *,
+        now: rospy.Time,
+        phase: str,
+        x: np.ndarray,
+        target_pos_ned: Optional[np.ndarray],
+        target_vel_ned: Optional[np.ndarray],
+        pos_ok: Optional[bool],
+        vel_ok: Optional[bool],
+        att_ok: Optional[bool],
+        hold_elapsed: Optional[float],
+        hold_required: Optional[float],
+        u_cmd: Optional[np.ndarray],
+        fail_reason: str,
+    ) -> None:
+        if (not self.diag_enable) or (self._diag_writer is None):
+            return
+
+        t_now = float(now.to_sec())
+        if self.diag_log_hz > 0.0 and self._diag_last_log_sec is not None:
+            if (t_now - float(self._diag_last_log_sec)) < (1.0 / self.diag_log_hz):
+                return
+
+        tar_p = np.array([np.nan, np.nan, np.nan], dtype=float)
+        tar_v = np.array([np.nan, np.nan, np.nan], dtype=float)
+        pos_e = np.array([np.nan, np.nan, np.nan], dtype=float)
+        vel_e = np.array([np.nan, np.nan, np.nan], dtype=float)
+
+        if target_pos_ned is not None:
+            tar_p = np.asarray(target_pos_ned, dtype=float).reshape(3)
+            pos_e = tar_p - np.array([x[0], x[1], x[4]], dtype=float)
+        if target_vel_ned is not None:
+            tar_v = np.asarray(target_vel_ned, dtype=float).reshape(3)
+            vel_e = tar_v - np.array([x[2], x[3], x[5]], dtype=float)
+
+        u = np.array([np.nan, np.nan, np.nan], dtype=float)
+        if u_cmd is not None:
+            u = np.asarray(u_cmd, dtype=float).reshape(3)
+
+        row = [
+            t_now,
+            phase,
+            float(x[0]), float(x[1]), float(x[4]),
+            float(x[2]), float(x[3]), float(x[5]),
+            float(x[6]), float(x[7]),
+            float(tar_p[0]), float(tar_p[1]), float(tar_p[2]),
+            float(tar_v[0]), float(tar_v[1]), float(tar_v[2]),
+            float(pos_e[0]), float(pos_e[1]), float(pos_e[2]),
+            float(vel_e[0]), float(vel_e[1]), float(vel_e[2]),
+            int(pos_ok) if pos_ok is not None else -1,
+            int(vel_ok) if vel_ok is not None else -1,
+            int(att_ok) if att_ok is not None else -1,
+            float(hold_elapsed) if hold_elapsed is not None else float("nan"),
+            float(hold_required) if hold_required is not None else float("nan"),
+            float(u[0]), float(u[1]), float(u[2]),
+            fail_reason,
+        ]
+
+        self._diag_writer.writerow(row)
+        self._diag_file.flush()
+        self._diag_last_log_sec = t_now
 
     # --------------------- conversion & command ---------------------
     def _enu_to_ned_state(self) -> np.ndarray:
@@ -471,14 +596,41 @@ class RtmpcGazeboNode:
                         yaw_cmd=yaw_cmd,
                     )
 
+                    pos_err_n = float(pos_err[0])
+                    pos_err_e = float(pos_err[1])
+                    pos_err_d = float(pos_err[2])
+                    vel_err_n = float(-x[2])
+                    vel_err_e = float(-x[3])
+                    vel_err_d = float(-x[5])
+                    fail_reason = self._diag_fail_reason(pos_ok=bool(pos_ok), vel_ok=bool(vel_ok), att_ok=True)
+                    self._diag_log(
+                        now=now,
+                        phase=phase,
+                        x=x,
+                        target_pos_ned=target_pos,
+                        target_vel_ned=np.zeros((3,), dtype=float),
+                        pos_ok=bool(pos_ok),
+                        vel_ok=bool(vel_ok),
+                        att_ok=True,
+                        hold_elapsed=float(hold_elapsed),
+                        hold_required=float(self.pre_align_hover_sec),
+                        u_cmd=u_pre,
+                        fail_reason=fail_reason,
+                    )
+
                     if loop_count % max(1, int(self.rate_hz)) == 0:
                         rospy.loginfo(
-                            "[rtmpc_gz][%s] |pos_err|=%.3f |vel|=%.3f hold=%.2f/%.2f",
+                            "[rtmpc_gz][%s] pos_err=(%.3f,%.3f,%.3f) vel_err=(%.3f,%.3f,%.3f) hold=%.2f/%.2f fail=%s",
                             phase,
-                            float(np.linalg.norm(pos_err)),
-                            float(np.linalg.norm(vel_now)),
+                            pos_err_n,
+                            pos_err_e,
+                            pos_err_d,
+                            vel_err_n,
+                            vel_err_e,
+                            vel_err_d,
                             float(hold_elapsed),
                             float(self.pre_align_hover_sec),
+                            fail_reason,
                         )
 
                     if hold_elapsed >= self.pre_align_hover_sec:
@@ -560,9 +712,25 @@ class RtmpcGazeboNode:
                         yaw_cmd=yaw_cmd,
                     )
 
+                    fail_reason = self._diag_fail_reason(pos_ok=bool(pos_ok), vel_ok=bool(vel_ok), att_ok=bool(att_ok))
+                    self._diag_log(
+                        now=now,
+                        phase=phase,
+                        x=x,
+                        target_pos_ned=self.start_pos_ned,
+                        target_vel_ned=self.start_vel_ned,
+                        pos_ok=bool(pos_ok),
+                        vel_ok=bool(vel_ok),
+                        att_ok=bool(att_ok),
+                        hold_elapsed=float(hold_elapsed),
+                        hold_required=float(self.line_entry_hold_sec),
+                        u_cmd=u_line,
+                        fail_reason=fail_reason,
+                    )
+
                     if loop_count % max(1, int(self.rate_hz)) == 0:
                         rospy.loginfo(
-                            "[rtmpc_gz][line_entry] pos_err=(%.3f,%.3f,%.3f) vel_err=(%.3f,%.3f,%.3f) att=(%.3f,%.3f) hold=%.2f/%.2f",
+                            "[rtmpc_gz][line_entry] pos_err=(%.3f,%.3f,%.3f) vel_err=(%.3f,%.3f,%.3f) att=(%.3f,%.3f) hold=%.2f/%.2f fail=%s",
                             pos_err_n,
                             pos_err_e,
                             pos_err_d,
@@ -573,6 +741,7 @@ class RtmpcGazeboNode:
                             float(x[7]),
                             float(hold_elapsed),
                             float(self.line_entry_hold_sec),
+                            fail_reason,
                         )
 
                     if hold_elapsed >= self.line_entry_hold_sec:
@@ -640,8 +809,23 @@ class RtmpcGazeboNode:
                     yaw_cmd=yaw_cmd,
                 )
 
+                err = x[:6] - x_des[0, :6]
+                self._diag_log(
+                    now=now,
+                    phase=phase,
+                    x=x,
+                    target_pos_ned=x_des[0, [0, 1, 4]],
+                    target_vel_ned=x_des[0, [2, 3, 5]],
+                    pos_ok=None,
+                    vel_ok=None,
+                    att_ok=None,
+                    hold_elapsed=None,
+                    hold_required=None,
+                    u_cmd=u,
+                    fail_reason="tracking",
+                )
+
                 if step_idx % max(1, int(self.rate_hz)) == 0:
-                    err = x[:6] - x_des[0, :6]
                     rospy.loginfo(
                         "[rtmpc_gz][rtmpc] k=%d |pos_err|=%.3f |vel_err|=%.3f dT=%.3f phi=%.3f th=%.3f",
                         step_idx,
