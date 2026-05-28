@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- RTMPC node only (no SITL bringup) -->
+  <arg name="node_name" default="rtmpc_gazebo_node"/>
+  <arg name="params_file" default="$(find off_node)/config/rtmpc_gazebo.yaml"/>
+  <arg name="output" default="screen"/>
+
+  <node pkg="off_node" type="rtmpc_gazebo_node.py" name="$(arg node_name)" output="$(arg output)">
+    <!-- Load as private params (~param) for this node -->
+    <rosparam command="load" file="$(arg params_file)"/>
+  </node>
+</launch>

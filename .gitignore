@@ -1,0 +1,45 @@
+# Catkin workspace artifacts
+build/
+devel/
+install/
+logs/
+.catkin_workspace
+
+# Local env/editor
+.venv/
+.vscode/
+**/.vscode/
+**/__pycache__/
+*.pyc
+
+# Generated files under workspace src/
+src/CMakeCache.txt
+src/CMakeFiles/
+src/CTestConfiguration.ini
+src/CTestCustom.cmake
+src/CTestTestfile.cmake
+src/Makefile
+src/atomic_configure/
+src/bin/
+src/catkin/
+src/catkin_generated/
+src/cmake_install.cmake
+src/compile_commands.json
+src/devel/
+src/gtest/
+src/test_results/
+
+# Generated files under package
+src/off_node/CMakeFiles/
+src/off_node/CTestTestfile.cmake
+src/off_node/Makefile
+src/off_node/catkin_generated/
+src/off_node/cmake_install.cmake
+
+# Data outputs
+src/data_gp/
+src/data_system_identification/
+
+# Workspace root helper files
+src/.cache/
+src/CMakeLists.txt

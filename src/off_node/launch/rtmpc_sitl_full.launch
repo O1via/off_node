@@ -1,0 +1,69 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Full stack: PX4 SITL + Gazebo + MAVROS + RTMPC node -->
+
+  <!-- Sim time -->
+  <param name="use_sim_time" value="true"/>
+
+  <!-- RTMPC node args -->
+  <arg name="node_name" default="rtmpc_gazebo_node"/>
+  <arg name="params_file" default="$(find off_node)/config/rtmpc_gazebo.yaml"/>
+  <arg name="output" default="screen"/>
+
+  <!-- Forwarded SITL args (same names as mavros_posix_sitl.launch) -->
+  <arg name="x" default="0"/>
+  <arg name="y" default="0"/>
+  <arg name="z" default="0"/>
+  <arg name="R" default="0"/>
+  <arg name="P" default="0"/>
+  <arg name="Y" default="1.57079632679"/>
+
+  <arg name="est" default="ekf2"/>
+  <arg name="vehicle" default="iris"/>
+  <!-- Use absolute defaults to avoid $(find mavlink_sitl_gazebo) dependency in this top launch.
+       Override these from CLI if you use a different PX4 tree. -->
+  <arg name="world" default="/home/zxy/PX4-Autopilot-new/Tools/sitl_gazebo/worlds/empty.world"/>
+  <arg name="sdf" default="/home/zxy/PX4-Autopilot-new/Tools/sitl_gazebo/models/iris/iris.sdf"/>
+
+  <arg name="gui" default="true"/>
+  <arg name="debug" default="false"/>
+  <arg name="verbose" default="false"/>
+  <arg name="paused" default="false"/>
+  <arg name="respawn_gazebo" default="false"/>
+
+  <arg name="fcu_url" default="udp://:14540@localhost:14557"/>
+  <arg name="respawn_mavros" default="false"/>
+  <arg name="interactive" default="true"/>
+
+  <!-- Bring up SITL stack -->
+  <include file="$(find px4)/launch/mavros_posix_sitl.launch">
+    <arg name="x" value="$(arg x)"/>
+    <arg name="y" value="$(arg y)"/>
+    <arg name="z" value="$(arg z)"/>
+    <arg name="R" value="$(arg R)"/>
+    <arg name="P" value="$(arg P)"/>
+    <arg name="Y" value="$(arg Y)"/>
+
+    <arg name="est" value="$(arg est)"/>
+    <arg name="vehicle" value="$(arg vehicle)"/>
+    <arg name="world" value="$(arg world)"/>
+    <arg name="sdf" value="$(arg sdf)"/>
+
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="debug" value="$(arg debug)"/>
+    <arg name="verbose" value="$(arg verbose)"/>
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="respawn_gazebo" value="$(arg respawn_gazebo)"/>
+
+    <arg name="fcu_url" value="$(arg fcu_url)"/>
+    <arg name="respawn_mavros" value="$(arg respawn_mavros)"/>
+    <arg name="interactive" value="$(arg interactive)"/>
+  </include>
+
+  <!-- Start RTMPC controller -->
+  <include file="$(find off_node)/launch/rtmpc_node.launch">
+    <arg name="node_name" value="$(arg node_name)"/>
+    <arg name="params_file" value="$(arg params_file)"/>
+    <arg name="output" value="$(arg output)"/>
+  </include>
+</launch>
