@@ -21,7 +21,7 @@ pre_align_enable: true
 pre_align_hover_sec: 10.0
 pre_align_pos_tol_m: 0.2
 pre_align_vel_tol_mps: 0.2
-pre_align_kp_pos_xy: 0.25
+pre_align_kp_pos_xy: 0.3
 pre_align_kd_vel_xy: 0.4
 pre_align_kp_pos_d: 0.2
 pre_align_kd_vel_d: 0.45
@@ -35,13 +35,22 @@ line_entry_staging_offset_m: 4.0
 line_entry_hold_sec: 0.1
 line_entry_timeout_sec: 30.0
 line_entry_force_start_on_timeout: false
-line_entry_pos_tol_n_m: 0.15
-line_entry_pos_tol_e_m: 0.15
-line_entry_pos_tol_d_m: 0.10
-line_entry_vel_tol_n_mps: 0.20
-line_entry_vel_tol_e_mps: 0.20
-line_entry_vel_tol_d_mps: 0.20
+line_entry_pos_tol_n_m: 0.3
+line_entry_pos_tol_e_m: 0.3
+line_entry_pos_tol_d_m: 0.12
+line_entry_vel_tol_n_mps: 0.30
+line_entry_vel_tol_e_mps: 0.30
+line_entry_vel_tol_d_mps: 0.30
 line_entry_att_tol_rad: 0.20
+
+# Line-entry controller gains (independent from pre_align gains)
+line_entry_kp_pos_xy: 0.3
+line_entry_kd_vel_xy: 0.8
+line_entry_kp_pos_d: 0.20
+line_entry_kd_vel_d: 0.5
+line_entry_max_tilt_deg: 10.0
+line_entry_require_qp_feasible: true
+line_entry_qp_feasible_eps: 1.0e-6
 
 # Disturbance / tube
 disturbance_mode: force_only

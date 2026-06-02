@@ -19,7 +19,7 @@ import csv
 import math
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import rospy
@@ -102,10 +102,17 @@ class RtmpcGazeboNode:
         self.line_entry_vel_tol_e_mps = float(rospy.get_param("~line_entry_vel_tol_e_mps", 0.20))
         self.line_entry_vel_tol_d_mps = float(rospy.get_param("~line_entry_vel_tol_d_mps", 0.20))
         self.line_entry_att_tol_rad = float(rospy.get_param("~line_entry_att_tol_rad", 0.20))
+        self.line_entry_kp_pos_xy = float(rospy.get_param("~line_entry_kp_pos_xy", 0.45))
+        self.line_entry_kd_vel_xy = float(rospy.get_param("~line_entry_kd_vel_xy", 0.55))
+        self.line_entry_kp_pos_d = float(rospy.get_param("~line_entry_kp_pos_d", 0.70))
+        self.line_entry_kd_vel_d = float(rospy.get_param("~line_entry_kd_vel_d", 0.60))
+        self.line_entry_max_tilt_deg = float(rospy.get_param("~line_entry_max_tilt_deg", 12.0))
+        self.line_entry_require_qp_feasible = bool(rospy.get_param("~line_entry_require_qp_feasible", True))
+        self.line_entry_qp_feasible_eps = float(rospy.get_param("~line_entry_qp_feasible_eps", 1e-6))
 
         # Disturbance/tube config
         self.disturbance_mode = str(rospy.get_param("~disturbance_mode", "force_only"))
-        self.force_bound_mg = float(rospy.get_param("~force_bound_mg", 0.15))
+        self.force_bound_mg = float(rospy.get_param("~force_bound_mg", 0.05))
         self.force_d_axis_scale = float(rospy.get_param("~force_d_axis_scale", 0.15))
 
         # GP options
@@ -275,6 +282,29 @@ class RtmpcGazeboNode:
         # Use (pn_start, pe_start +/- offset, pd_start) so vehicle can build the correct
         # tangential speed before entering RTMPC at the fixed start point.
         self.stage_pos_ned[1] = float(self.start_pos_ned[1] - ve_sign * self.line_entry_staging_offset_m)
+
+    def _line_entry_qp_initial_feasible(self, x: np.ndarray) -> Tuple[bool, str]:
+        """Check if current state can satisfy QP initial tube/state intersection.
+
+        Mirrors the initial bound consistency check in solve_rtmc_qp_paper:
+        x̄0 must satisfy both tightened state bounds and tube init bounds around x_meas.
+        """
+        eps = float(max(self.line_entry_qp_feasible_eps, 0.0))
+        x_lb = np.maximum(self.x_min_t, x - self.z_half)
+        x_ub = np.minimum(self.x_max_t, x + self.z_half)
+
+        bad = np.where(x_ub <= (x_lb + eps))[0]
+        if bad.size == 0:
+            return True, "ok"
+
+        names = ["pn", "pe", "vn", "ve", "pd", "vd", "phi", "theta"]
+        i = int(bad[0])
+        name = names[i] if i < len(names) else f"x{i}"
+        detail = (
+            f"dim={i}({name}), lb={float(x_lb[i]):.6f}, ub={float(x_ub[i]):.6f}, "
+            f"x_meas={float(x[i]):.6f}, z={float(self.z_half[i]):.6f}, eps={eps:.2e}"
+        )
+        return False, detail
 
     # --------------------- callbacks ---------------------
     def _state_cb(self, msg: State) -> None:
@@ -462,13 +492,19 @@ class RtmpcGazeboNode:
         idx = (np.arange(self.horizon + 1, dtype=int) + int(step_idx)) % int(self.x_ref_period.shape[0])
         return self.x_ref_period[idx]
 
-    def _pre_align_command(
+    def _pd_position_velocity_command(
         self,
         x: np.ndarray,
         target_pos_ned: np.ndarray,
-        target_vel_ned: Optional[np.ndarray] = None,
+        target_vel_ned: Optional[np.ndarray],
+        *,
+        kp_pos_xy: float,
+        kd_vel_xy: float,
+        kp_pos_d: float,
+        kd_vel_d: float,
+        max_tilt_deg: float,
     ) -> np.ndarray:
-        """PD pre-controller for position + velocity shaping before RTMPC."""
+        """Generic PD controller used by pre-align and line-entry stages."""
         pn_ref, pe_ref, pd_ref = [float(v) for v in target_pos_ned]
         if target_vel_ned is None:
             target_vel_ned = np.zeros((3,), dtype=float)
@@ -477,15 +513,15 @@ class RtmpcGazeboNode:
         pos_err = np.array([pn_ref - x[0], pe_ref - x[1], pd_ref - x[4]], dtype=float)
         vel_err = np.array([vn_ref - x[2], ve_ref - x[3], vd_ref - x[5]], dtype=float)
 
-        a_n = self.pre_align_kp_pos_xy * pos_err[0] + self.pre_align_kd_vel_xy * vel_err[0]
-        a_e = self.pre_align_kp_pos_xy * pos_err[1] + self.pre_align_kd_vel_xy * vel_err[1]
-        a_d = self.pre_align_kp_pos_d * pos_err[2] + self.pre_align_kd_vel_d * vel_err[2]
+        a_n = kp_pos_xy * pos_err[0] + kd_vel_xy * vel_err[0]
+        a_e = kp_pos_xy * pos_err[1] + kd_vel_xy * vel_err[1]
+        a_d = kp_pos_d * pos_err[2] + kd_vel_d * vel_err[2]
 
         theta_cmd = float(a_n / max(self.g, 1e-6))
         phi_cmd = float(a_e / max(self.g, 1e-6))
         dT_cmd = float(-self.mass_kg * a_d)
 
-        max_tilt = math.radians(self.pre_align_max_tilt_deg)
+        max_tilt = math.radians(max_tilt_deg)
         phi_cmd = float(np.clip(phi_cmd, -max_tilt, max_tilt))
         theta_cmd = float(np.clip(theta_cmd, -max_tilt, max_tilt))
 
@@ -495,6 +531,40 @@ class RtmpcGazeboNode:
         theta_cmd = float(np.clip(theta_cmd, self.u_min_base[2], self.u_max_base[2]))
 
         return np.array([dT_cmd, phi_cmd, theta_cmd], dtype=float)
+
+    def _pre_align_command(
+        self,
+        x: np.ndarray,
+        target_pos_ned: np.ndarray,
+        target_vel_ned: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        return self._pd_position_velocity_command(
+            x=x,
+            target_pos_ned=target_pos_ned,
+            target_vel_ned=target_vel_ned,
+            kp_pos_xy=self.pre_align_kp_pos_xy,
+            kd_vel_xy=self.pre_align_kd_vel_xy,
+            kp_pos_d=self.pre_align_kp_pos_d,
+            kd_vel_d=self.pre_align_kd_vel_d,
+            max_tilt_deg=self.pre_align_max_tilt_deg,
+        )
+
+    def _line_entry_command(
+        self,
+        x: np.ndarray,
+        target_pos_ned: np.ndarray,
+        target_vel_ned: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        return self._pd_position_velocity_command(
+            x=x,
+            target_pos_ned=target_pos_ned,
+            target_vel_ned=target_vel_ned,
+            kp_pos_xy=self.line_entry_kp_pos_xy,
+            kd_vel_xy=self.line_entry_kd_vel_xy,
+            kp_pos_d=self.line_entry_kp_pos_d,
+            kd_vel_d=self.line_entry_kd_vel_d,
+            max_tilt_deg=self.line_entry_max_tilt_deg,
+        )
 
     # --------------------- offboard helpers ---------------------
     def _try_set_offboard_and_arm(self, now: rospy.Time, last_request: rospy.Time) -> rospy.Time:
@@ -672,7 +742,7 @@ class RtmpcGazeboNode:
                     continue
 
                 if phase == "line_entry":
-                    u_line = self._pre_align_command(
+                    u_line = self._line_entry_command(
                         x=x,
                         target_pos_ned=self.start_pos_ned,
                         target_vel_ned=self.start_vel_ned,
@@ -744,11 +814,19 @@ class RtmpcGazeboNode:
                             fail_reason,
                         )
 
-                    if hold_elapsed >= self.line_entry_hold_sec:
-                        phase = "rtmpc"
-                        step_idx = 0
-                        rospy.loginfo("[rtmpc_gz] line_entry finished, switch to RTMPC")
-                        continue
+                    if pos_ok and vel_ok and att_ok and (hold_elapsed >= self.line_entry_hold_sec):
+                        can_switch = True
+                        feas_detail = "disabled"
+                        if self.line_entry_require_qp_feasible:
+                            can_switch, feas_detail = self._line_entry_qp_initial_feasible(x)
+
+                        if can_switch:
+                            phase = "rtmpc"
+                            step_idx = 0
+                            rospy.loginfo("[rtmpc_gz] line_entry finished, switch to RTMPC")
+                            continue
+
+                        rospy.logwarn_throttle(1.0, "[rtmpc_gz] line_entry gate blocked by qp-feasibility: %s", feas_detail)
 
                     if self.line_entry_timeout_sec > 0.0 and line_entry_t0 is not None:
                         elapsed = (now - line_entry_t0).to_sec()
