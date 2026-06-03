@@ -5,13 +5,13 @@
 
 Fixed workflow target:
 - iris linear RTMPC (8-state)
-- circular tracking
-- receding-horizon QP solve each control cycle
+- full reference trajectory: takeoff/entry segment + circular tracking
+- one RTMPC controller from the beginning; no PD pre-align or controller switch
 
 Main loop:
 1) read current UAV state from MAVROS (ENU)
 2) convert to RTMPC state (NED)
-3) solve RTMPC QP
+3) solve RTMPC QP against the full reference trajectory
 4) publish attitude+thrust command to UAV
 """
 
@@ -19,7 +19,7 @@ import csv
 import math
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import rospy
@@ -45,11 +45,11 @@ from rtmpc_constants import (  # noqa: E402
 from rtmpc_demo import (  # noqa: E402
     LinearIrisHover,
     apply_tracking_profile_iris,
-    build_circle_reference,
+    build_takeoff_entry_circle_reference,
     compute_infinite_lqr,
     compute_rpi_box,
-    solve_rtmc_qp_with_gp_stagewise,
     solve_rtmc_qp_paper,
+    solve_rtmc_qp_with_gp_stagewise,
     tighten_box_bounds_with_auto_scale,
 )
 
@@ -62,89 +62,83 @@ class RtmpcGazeboNode:
         self.horizon = int(rospy.get_param("~horizon", 30))
 
         self.auto_offboard_arm = bool(rospy.get_param("~auto_offboard_arm", True))
-        self.yaw_deg = float(rospy.get_param("~yaw_deg", 0.0))
+        self.start_delay_sec = float(rospy.get_param("~start_delay_sec", 1.0))
+        self.yaw_deg = float(rospy.get_param("~yaw_deg", 90.0))
 
-        # Circle task
+        # Full reference task, aligned with py/rtmpc_demo.py takeoff_circle mode.
+        self.takeoff_start_ned = np.asarray(
+            rospy.get_param("~takeoff_start_ned", [0.0, 0.0, 0.0]), dtype=float
+        ).reshape(3)
+        self.entry_steps = int(rospy.get_param("~entry_steps", 140))
         self.circle_radius = float(rospy.get_param("~circle_radius", 4.0))
+        self.reference_altitude_m = float(rospy.get_param("~reference_altitude_m", 2.0))
+        # Match the pure-code demo geometry: start at local origin, shift the circle south
+        # so the vehicle enters the circle along the tangent direction.
+        self.circle_center_ne = np.array(
+            [
+                self.takeoff_start_ned[0] - self.circle_radius,
+                self.takeoff_start_ned[1] - 2.0 * self.circle_radius,
+            ],
+            dtype=float,
+        )
         self.circle_period_steps = int(rospy.get_param("~circle_period_steps", 126))
         self.clockwise = bool(rospy.get_param("~clockwise", True))
-        self.ref_pd = float(rospy.get_param("~ref_pd", -1.0))  # NED down, so altitude ~1m => pd=-1
         self.tracking_profile = str(rospy.get_param("~tracking_profile", "high_speed_extension"))
 
-        # Pre-align stage: first hover at a staging point, then straight-line entry to
-        # the circle start point with matched tangential speed, then switch to RTMPC.
-        self.pre_align_enable = bool(rospy.get_param("~pre_align_enable", True))
-        self.pre_align_hover_sec = float(rospy.get_param("~pre_align_hover_sec", 3.0))
-        self.pre_align_pos_tol_m = float(rospy.get_param("~pre_align_pos_tol_m", 0.20))
-        self.pre_align_vel_tol_mps = float(rospy.get_param("~pre_align_vel_tol_mps", 0.25))
-        self.pre_align_kp_pos_xy = float(rospy.get_param("~pre_align_kp_pos_xy", 0.45))
-        self.pre_align_kd_vel_xy = float(rospy.get_param("~pre_align_kd_vel_xy", 0.55))
-        self.pre_align_kp_pos_d = float(rospy.get_param("~pre_align_kp_pos_d", 0.70))
-        self.pre_align_kd_vel_d = float(rospy.get_param("~pre_align_kd_vel_d", 0.60))
-        self.pre_align_max_tilt_deg = float(rospy.get_param("~pre_align_max_tilt_deg", 12.0))
-        self.pre_align_timeout_sec = float(rospy.get_param("~pre_align_timeout_sec", 120.0))
-        self.pre_align_force_start_on_timeout = bool(
-            rospy.get_param("~pre_align_force_start_on_timeout", False)
-        )
+        # Softer objective for the takeoff/entry segment. The tube feedback K and
+        # tightened bounds still use the nominal RTMPC design; only QP tracking
+        # weights are changed before the circular segment.
+        self.entry_q_scale = float(rospy.get_param("~entry_q_scale", 0.3))
+        self.entry_r_scale = float(rospy.get_param("~entry_r_scale", 3.0))
 
-        # Straight-line entry stage (from staging point to circle start point).
-        self.line_entry_enable = bool(rospy.get_param("~line_entry_enable", True))
-        self.line_entry_staging_offset_m = float(rospy.get_param("~line_entry_staging_offset_m", 2.0))
-        self.line_entry_hold_sec = float(rospy.get_param("~line_entry_hold_sec", 1.0))
-        self.line_entry_timeout_sec = float(rospy.get_param("~line_entry_timeout_sec", 30.0))
-        self.line_entry_force_start_on_timeout = bool(
-            rospy.get_param("~line_entry_force_start_on_timeout", False)
-        )
-        self.line_entry_pos_tol_n_m = float(rospy.get_param("~line_entry_pos_tol_n_m", 0.15))
-        self.line_entry_pos_tol_e_m = float(rospy.get_param("~line_entry_pos_tol_e_m", 0.15))
-        self.line_entry_pos_tol_d_m = float(rospy.get_param("~line_entry_pos_tol_d_m", 0.10))
-        self.line_entry_vel_tol_n_mps = float(rospy.get_param("~line_entry_vel_tol_n_mps", 0.20))
-        self.line_entry_vel_tol_e_mps = float(rospy.get_param("~line_entry_vel_tol_e_mps", 0.20))
-        self.line_entry_vel_tol_d_mps = float(rospy.get_param("~line_entry_vel_tol_d_mps", 0.20))
-        self.line_entry_att_tol_rad = float(rospy.get_param("~line_entry_att_tol_rad", 0.20))
-        self.line_entry_kp_pos_xy = float(rospy.get_param("~line_entry_kp_pos_xy", 0.45))
-        self.line_entry_kd_vel_xy = float(rospy.get_param("~line_entry_kd_vel_xy", 0.55))
-        self.line_entry_kp_pos_d = float(rospy.get_param("~line_entry_kp_pos_d", 0.70))
-        self.line_entry_kd_vel_d = float(rospy.get_param("~line_entry_kd_vel_d", 0.60))
-        self.line_entry_max_tilt_deg = float(rospy.get_param("~line_entry_max_tilt_deg", 12.0))
-        self.line_entry_require_qp_feasible = bool(rospy.get_param("~line_entry_require_qp_feasible", True))
-        self.line_entry_qp_feasible_eps = float(rospy.get_param("~line_entry_qp_feasible_eps", 1e-6))
-
-        # Disturbance/tube config
+        # Disturbance/tube config.
         self.disturbance_mode = str(rospy.get_param("~disturbance_mode", "force_only"))
-        self.force_bound_mg = float(rospy.get_param("~force_bound_mg", 0.05))
+        self.force_bound_mg = float(rospy.get_param("~force_bound_mg", 0.0))
         self.force_d_axis_scale = float(rospy.get_param("~force_d_axis_scale", 0.15))
 
-        # GP options
+        # GP options. The RTMPC controller runs throughout the trajectory; GP mean
+        # compensation is only applied after the entry segment, where training data is in-distribution.
         self.use_gp = bool(rospy.get_param("~use_gp", False))
-        self.gp_model_path = str(rospy.get_param("~gp_model_path", "/home/zxy/work/gp_model/iris_linear_residual_gp.npz"))
+        self.gp_model_path = str(
+            rospy.get_param("~gp_model_path", "/home/zxy/work/gp_model/iris_linear_residual_gp.npz")
+        )
         self.gp_beta_sigma = float(rospy.get_param("~gp_beta_sigma", 1.0))
-        self.gp_shrink_mode = str(rospy.get_param("~gp_shrink_mode", "residual"))  # none|residual
+        self.gp_shrink_mode = str(rospy.get_param("~gp_shrink_mode", "residual"))
         self.gp_stagewise_refine_steps = int(rospy.get_param("~gp_stagewise_refine_steps", 1))
         self.gp_grid_points_per_dim = int(rospy.get_param("~gp_grid_points_per_dim", 9))
 
-        # Thrust mapping
+        # Vehicle / thrust mapping.
         self.mass_kg = float(rospy.get_param("~mass_kg", 1.5))
         self.g = float(rospy.get_param("~g", 9.81))
-        self.hover_thrust_norm = float(rospy.get_param("~hover_thrust_norm", 0.60))
-        # If <=0: auto set to mass*g/hover_thrust_norm
+        self.hover_thrust_norm = float(rospy.get_param("~hover_thrust_norm", 0.705))
+        # If <=0: auto set to mass*g/hover_thrust_norm.
         self.thrust_to_dT_scale = float(rospy.get_param("~thrust_to_dT_scale", -1.0))
 
-        # Optional sign tuning for frame convention mismatch
+        # Output command slew-rate limiting. This protects PX4/Gazebo from impulsive RTMPC commands.
+        self.command_slew_enable = bool(rospy.get_param("~command_slew_enable", True))
+        self.max_dT_rate_nps = float(rospy.get_param("~max_dT_rate_nps", 8.0))
+        self.max_phi_rate_radps = float(rospy.get_param("~max_phi_rate_radps", 0.30))
+        self.max_theta_rate_radps = float(rospy.get_param("~max_theta_rate_radps", 0.30))
+        self._last_cmd: Optional[np.ndarray] = None
+        self._last_cmd_time: Optional[rospy.Time] = None
+
+        # Optional sign tuning for frame convention mismatch.
         self.state_roll_sign = float(rospy.get_param("~state_roll_sign", 1.0))
         self.state_pitch_sign = float(rospy.get_param("~state_pitch_sign", 1.0))
         self.cmd_roll_sign = float(rospy.get_param("~cmd_roll_sign", 1.0))
         self.cmd_pitch_sign = float(rospy.get_param("~cmd_pitch_sign", 1.0))
 
-        # Topics
+        # Topics.
         self.pose_topic = str(rospy.get_param("~pose_topic", "mavros/local_position/pose"))
         self.vel_topic = str(rospy.get_param("~vel_topic", "mavros/local_position/velocity_local"))
         self.state_topic = str(rospy.get_param("~state_topic", "mavros/state"))
         self.att_sp_topic = str(rospy.get_param("~att_sp_topic", "mavros/setpoint_raw/attitude"))
 
-        # Diagnostics
+        # Diagnostics.
         self.diag_enable = bool(rospy.get_param("~diag_enable", True))
-        self.diag_csv_path = str(rospy.get_param("~diag_csv_path", "/tmp/rtmpc_diag.csv"))
+        self.diag_csv_path = str(
+            rospy.get_param("~diag_csv_path", "/home/zxy/off_node/src/off_node/diag_outputs/rtmpc_diag.csv")
+        )
         self.diag_log_hz = float(rospy.get_param("~diag_log_hz", 10.0))
 
         # --------------------- ROS io ---------------------
@@ -170,10 +164,16 @@ class RtmpcGazeboNode:
 
         self.Qx = state_cost_matrix(self.dynamics)
         self.Ru = input_cost_matrix(self.dynamics, self.m)
+        if self.entry_q_scale <= 0.0 or self.entry_r_scale <= 0.0:
+            raise ValueError("entry_q_scale and entry_r_scale must be positive")
         self.Px, self.K = compute_infinite_lqr(self.A, self.B, self.Qx, self.Ru)
+        self.Qx_entry = self.Qx * self.entry_q_scale
+        self.Ru_entry = self.Ru * self.entry_r_scale
+        self.Px_entry, _ = compute_infinite_lqr(self.A, self.B, self.Qx_entry, self.Ru_entry)
 
         self.x_min_base, self.x_max_base = base_state_bounds(self.dynamics)
         self.u_min_base, self.u_max_base = base_input_bounds(self.dynamics, mass=self.mass_kg, m=self.m)
+        self._expand_state_bounds_for_full_reference()
 
         self.gp_model: Optional[VelocityResidualGP] = None
         self._prepare_tube_and_bounds()
@@ -181,10 +181,47 @@ class RtmpcGazeboNode:
         self._init_diag_logger()
 
         rospy.loginfo("[rtmpc_gz] init done")
-        rospy.loginfo("[rtmpc_gz] dt=%.3f, horizon=%d, radius=%.2f, period=%d", self.dt, self.horizon,
-                      self.circle_radius, self.circle_period_steps)
+        rospy.loginfo(
+            "[rtmpc_gz] dt=%.3f, horizon=%d, entry_steps=%d, radius=%.2f, period=%d",
+            self.dt,
+            self.horizon,
+            self.entry_steps,
+            self.circle_radius,
+            self.circle_period_steps,
+        )
+        rospy.loginfo(
+            "[rtmpc_gz] entry objective scales: Qx*=%.3f, Ru*=%.3f; circle uses nominal weights",
+            self.entry_q_scale,
+            self.entry_r_scale,
+        )
 
     # --------------------- setup helpers ---------------------
+    def _expand_state_bounds_for_full_reference(self) -> None:
+        """Expand local task bounds so the configured full reference is feasible."""
+        if self.entry_steps < 2:
+            raise ValueError("entry_steps must be >= 2")
+        if self.circle_period_steps <= 0:
+            raise ValueError("circle_period_steps must be positive")
+
+        pos_margin = 1.0
+        circle_ne_extent = np.abs(self.circle_center_ne) + float(self.circle_radius)
+        max_ne = max(
+            float(np.max(np.abs(self.takeoff_start_ned[:2]))) + pos_margin,
+            float(np.max(circle_ne_extent)) + pos_margin,
+        )
+        self.x_min_base = self.x_min_base.copy()
+        self.x_max_base = self.x_max_base.copy()
+        self.x_min_base[0] = min(float(self.x_min_base[0]), -max_ne)
+        self.x_max_base[0] = max(float(self.x_max_base[0]), max_ne)
+        self.x_min_base[1] = min(float(self.x_min_base[1]), -max_ne)
+        self.x_max_base[1] = max(float(self.x_max_base[1]), max_ne)
+        self.x_max_base[4] = max(float(self.x_max_base[4]), float(self.takeoff_start_ned[2]) + 0.2)
+        rospy.loginfo(
+            "[rtmpc_gz] expanded bounds for full reference: n/e half=%.2f, pd_max=%.2f",
+            max_ne,
+            float(self.x_max_base[4]),
+        )
+
     def _prepare_tube_and_bounds(self) -> None:
         base_w_half = disturbance_half_bounds(
             self.dynamics,
@@ -245,66 +282,40 @@ class RtmpcGazeboNode:
         rospy.loginfo("[rtmpc_gz] gamma_x=%.4f, gamma_u=%.4f", self.gamma_x, self.gamma_u)
 
     def _prepare_reference(self) -> None:
-        total_len = max(self.circle_period_steps, self.horizon + 1)
-        xy_ref = build_circle_reference(
-            x0=np.zeros((4,), dtype=float),
+        circle_len = max(self.circle_period_steps, self.horizon + 1)
+        total_len = int(self.entry_steps) + int(circle_len)
+        x_ref_full = build_takeoff_entry_circle_reference(
             total_len=total_len,
-            dt=self.dt,
-            radius=self.circle_radius,
-            period_steps=self.circle_period_steps,
-            clockwise=self.clockwise,
+            dt=float(self.dt),
+            start_ned=self.takeoff_start_ned,
+            radius=float(self.circle_radius),
+            period_steps=int(self.circle_period_steps),
+            entry_steps=int(self.entry_steps),
+            clockwise=bool(self.clockwise),
+            circle_center_ne=self.circle_center_ne,
+            reference_altitude_m=float(self.reference_altitude_m),
         )
-
-        x_ref = np.zeros((total_len, self.n), dtype=float)
-        # Keep the same convention as your existing python workflow:
-        # state=[pn, pe, vn, ve, pd, vd, phi, theta]
-        x_ref[:, 0] = xy_ref[:, 0]
-        x_ref[:, 1] = xy_ref[:, 1]
-        x_ref[:, 2] = xy_ref[:, 2]
-        x_ref[:, 3] = xy_ref[:, 3]
-        x_ref[:, 4] = float(self.ref_pd)
-
-        self.x_ref_period = apply_tracking_profile_iris(
-            x_ref,
+        x_ref_full = apply_tracking_profile_iris(
+            x_ref_full,
             dt=self.dt,
             tracking_profile=self.tracking_profile,
             g=self.g,
             phi_bounds=(float(self.x_min_base[6]), float(self.x_max_base[6])),
             theta_bounds=(float(self.x_min_base[7]), float(self.x_max_base[7])),
         )
-
-        # Circle start point and desired tangential speed for line-entry stage.
-        self.start_pos_ned = self.x_ref_period[0, [0, 1, 4]].copy()
-        self.start_vel_ned = self.x_ref_period[0, [2, 3, 5]].copy()
-        ve_ref = float(self.start_vel_ned[1])
-        ve_sign = float(np.sign(ve_ref)) if abs(ve_ref) > 1e-6 else (-1.0 if self.clockwise else 1.0)
-        self.stage_pos_ned = self.start_pos_ned.copy()
-        # Use (pn_start, pe_start +/- offset, pd_start) so vehicle can build the correct
-        # tangential speed before entering RTMPC at the fixed start point.
-        self.stage_pos_ned[1] = float(self.start_pos_ned[1] - ve_sign * self.line_entry_staging_offset_m)
-
-    def _line_entry_qp_initial_feasible(self, x: np.ndarray) -> Tuple[bool, str]:
-        """Check if current state can satisfy QP initial tube/state intersection.
-
-        Mirrors the initial bound consistency check in solve_rtmc_qp_paper:
-        x̄0 must satisfy both tightened state bounds and tube init bounds around x_meas.
-        """
-        eps = float(max(self.line_entry_qp_feasible_eps, 0.0))
-        x_lb = np.maximum(self.x_min_t, x - self.z_half)
-        x_ub = np.minimum(self.x_max_t, x + self.z_half)
-
-        bad = np.where(x_ub <= (x_lb + eps))[0]
-        if bad.size == 0:
-            return True, "ok"
-
-        names = ["pn", "pe", "vn", "ve", "pd", "vd", "phi", "theta"]
-        i = int(bad[0])
-        name = names[i] if i < len(names) else f"x{i}"
-        detail = (
-            f"dim={i}({name}), lb={float(x_lb[i]):.6f}, ub={float(x_ub[i]):.6f}, "
-            f"x_meas={float(x[i]):.6f}, z={float(self.z_half[i]):.6f}, eps={eps:.2e}"
+        self.x_ref_entry = x_ref_full[: self.entry_steps].copy()
+        self.x_ref_circle_period = x_ref_full[
+            self.entry_steps : self.entry_steps + self.circle_period_steps
+        ].copy()
+        self.x_ref_full = x_ref_full.copy()
+        rospy.loginfo(
+            "[rtmpc_gz] full reference: takeoff_start_ned=%s, circle_center_ne=%s, altitude=%.2fm, entry_steps=%d, circle_steps=%d",
+            np.array2string(self.takeoff_start_ned, precision=3),
+            np.array2string(self.circle_center_ne, precision=3),
+            float(self.reference_altitude_m),
+            int(self.entry_steps),
+            int(self.circle_period_steps),
         )
-        return False, detail
 
     # --------------------- callbacks ---------------------
     def _state_cb(self, msg: State) -> None:
@@ -316,6 +327,7 @@ class RtmpcGazeboNode:
     def _vel_cb(self, msg: TwistStamped) -> None:
         self.vel_msg = msg
 
+    # --------------------- diagnostics ---------------------
     def _init_diag_logger(self) -> None:
         self._diag_file = None
         self._diag_writer = None
@@ -337,9 +349,8 @@ class RtmpcGazeboNode:
                 "target_vn", "target_ve", "target_vd",
                 "pos_err_n", "pos_err_e", "pos_err_d",
                 "vel_err_n", "vel_err_e", "vel_err_d",
-                "pos_ok", "vel_ok", "att_ok",
-                "hold_elapsed", "hold_required",
                 "u_dT", "u_phi", "u_theta",
+                "u_raw_dT", "u_raw_phi", "u_raw_theta",
                 "fail_reason",
             ]
         )
@@ -360,32 +371,17 @@ class RtmpcGazeboNode:
                 pass
             self._diag_file = None
 
-    @staticmethod
-    def _diag_fail_reason(pos_ok: bool, vel_ok: bool, att_ok: bool) -> str:
-        reasons = []
-        if not pos_ok:
-            reasons.append("pos")
-        if not vel_ok:
-            reasons.append("vel")
-        if not att_ok:
-            reasons.append("att")
-        return "ok" if not reasons else "+".join(reasons)
-
     def _diag_log(
         self,
         *,
         now: rospy.Time,
         phase: str,
         x: np.ndarray,
-        target_pos_ned: Optional[np.ndarray],
-        target_vel_ned: Optional[np.ndarray],
-        pos_ok: Optional[bool],
-        vel_ok: Optional[bool],
-        att_ok: Optional[bool],
-        hold_elapsed: Optional[float],
-        hold_required: Optional[float],
+        target_pos_ned: np.ndarray,
+        target_vel_ned: np.ndarray,
         u_cmd: Optional[np.ndarray],
         fail_reason: str,
+        u_raw: Optional[np.ndarray] = None,
     ) -> None:
         if (not self.diag_enable) or (self._diag_writer is None):
             return
@@ -395,42 +391,34 @@ class RtmpcGazeboNode:
             if (t_now - float(self._diag_last_log_sec)) < (1.0 / self.diag_log_hz):
                 return
 
-        tar_p = np.array([np.nan, np.nan, np.nan], dtype=float)
-        tar_v = np.array([np.nan, np.nan, np.nan], dtype=float)
-        pos_e = np.array([np.nan, np.nan, np.nan], dtype=float)
-        vel_e = np.array([np.nan, np.nan, np.nan], dtype=float)
-
-        if target_pos_ned is not None:
-            tar_p = np.asarray(target_pos_ned, dtype=float).reshape(3)
-            pos_e = tar_p - np.array([x[0], x[1], x[4]], dtype=float)
-        if target_vel_ned is not None:
-            tar_v = np.asarray(target_vel_ned, dtype=float).reshape(3)
-            vel_e = tar_v - np.array([x[2], x[3], x[5]], dtype=float)
+        tar_p = np.asarray(target_pos_ned, dtype=float).reshape(3)
+        tar_v = np.asarray(target_vel_ned, dtype=float).reshape(3)
+        pos_e = tar_p - np.array([x[0], x[1], x[4]], dtype=float)
+        vel_e = tar_v - np.array([x[2], x[3], x[5]], dtype=float)
 
         u = np.array([np.nan, np.nan, np.nan], dtype=float)
         if u_cmd is not None:
             u = np.asarray(u_cmd, dtype=float).reshape(3)
+        raw = u.copy()
+        if u_raw is not None:
+            raw = np.asarray(u_raw, dtype=float).reshape(3)
 
-        row = [
-            t_now,
-            phase,
-            float(x[0]), float(x[1]), float(x[4]),
-            float(x[2]), float(x[3]), float(x[5]),
-            float(x[6]), float(x[7]),
-            float(tar_p[0]), float(tar_p[1]), float(tar_p[2]),
-            float(tar_v[0]), float(tar_v[1]), float(tar_v[2]),
-            float(pos_e[0]), float(pos_e[1]), float(pos_e[2]),
-            float(vel_e[0]), float(vel_e[1]), float(vel_e[2]),
-            int(pos_ok) if pos_ok is not None else -1,
-            int(vel_ok) if vel_ok is not None else -1,
-            int(att_ok) if att_ok is not None else -1,
-            float(hold_elapsed) if hold_elapsed is not None else float("nan"),
-            float(hold_required) if hold_required is not None else float("nan"),
-            float(u[0]), float(u[1]), float(u[2]),
-            fail_reason,
-        ]
-
-        self._diag_writer.writerow(row)
+        self._diag_writer.writerow(
+            [
+                t_now,
+                phase,
+                float(x[0]), float(x[1]), float(x[4]),
+                float(x[2]), float(x[3]), float(x[5]),
+                float(x[6]), float(x[7]),
+                float(tar_p[0]), float(tar_p[1]), float(tar_p[2]),
+                float(tar_v[0]), float(tar_v[1]), float(tar_v[2]),
+                float(pos_e[0]), float(pos_e[1]), float(pos_e[2]),
+                float(vel_e[0]), float(vel_e[1]), float(vel_e[2]),
+                float(u[0]), float(u[1]), float(u[2]),
+                float(raw[0]), float(raw[1]), float(raw[2]),
+                fail_reason,
+            ]
+        )
         self._diag_file.flush()
         self._diag_last_log_sec = t_now
 
@@ -443,16 +431,13 @@ class RtmpcGazeboNode:
         v = self.vel_msg.twist.linear
         q = self.pose_msg.pose.orientation
 
-        # ENU -> NED
         pn = float(p.y)
         pe = float(p.x)
         pd = float(-p.z)
-
         vn = float(v.y)
         ve = float(v.x)
         vd = float(-v.z)
 
-        # attitude (small-angle approximation with sign tuners)
         roll_enu, pitch_enu, _ = tft.euler_from_quaternion([q.x, q.y, q.z, q.w])
         phi = self.state_roll_sign * float(roll_enu)
         theta = self.state_pitch_sign * float(pitch_enu)
@@ -466,17 +451,46 @@ class RtmpcGazeboNode:
         thrust = self.hover_thrust_norm + float(dT) / float(scale)
         return float(np.clip(thrust, 0.0, 1.0))
 
-    def _publish_attitude_cmd(self, dT: float, phi_cmd: float, theta_cmd: float, yaw_cmd: float) -> None:
+    def _apply_command_slew(self, u_cmd: np.ndarray, now: rospy.Time) -> np.ndarray:
+        u_cmd = np.asarray(u_cmd, dtype=float).reshape(3)
+        if not self.command_slew_enable:
+            self._last_cmd = u_cmd.copy()
+            self._last_cmd_time = now
+            return u_cmd
+
+        if self._last_cmd is None or self._last_cmd_time is None:
+            self._last_cmd = np.zeros(3, dtype=float)
+            self._last_cmd_time = now
+
+        dt_sec = max(1.0 / max(self.rate_hz, 1e-6), float((now - self._last_cmd_time).to_sec()))
+        max_delta = np.array(
+            [
+                max(0.0, self.max_dT_rate_nps) * dt_sec,
+                max(0.0, self.max_phi_rate_radps) * dt_sec,
+                max(0.0, self.max_theta_rate_radps) * dt_sec,
+            ],
+            dtype=float,
+        )
+        delta = np.clip(u_cmd - self._last_cmd, -max_delta, max_delta)
+        u_limited = self._last_cmd + delta
+        self._last_cmd = u_limited.copy()
+        self._last_cmd_time = now
+        return u_limited
+
+    def _publish_attitude_cmd(self, dT: float, phi_cmd: float, theta_cmd: float, yaw_cmd: float) -> np.ndarray:
+        now = rospy.Time.now()
+        u_sent = self._apply_command_slew(np.array([dT, phi_cmd, theta_cmd], dtype=float), now)
+
         msg = AttitudeTarget()
-        msg.header.stamp = rospy.Time.now()
+        msg.header.stamp = now
         msg.type_mask = (
             AttitudeTarget.IGNORE_ROLL_RATE
             | AttitudeTarget.IGNORE_PITCH_RATE
             | AttitudeTarget.IGNORE_YAW_RATE
         )
 
-        roll = self.cmd_roll_sign * float(phi_cmd)
-        pitch = self.cmd_pitch_sign * float(theta_cmd)
+        roll = self.cmd_roll_sign * float(u_sent[1])
+        pitch = self.cmd_pitch_sign * float(u_sent[2])
         yaw = float(yaw_cmd)
 
         q = tft.quaternion_from_euler(roll, pitch, yaw)
@@ -484,87 +498,19 @@ class RtmpcGazeboNode:
         msg.orientation.y = float(q[1])
         msg.orientation.z = float(q[2])
         msg.orientation.w = float(q[3])
-        msg.thrust = self._dT_to_thrust_norm(dT)
-
+        msg.thrust = self._dT_to_thrust_norm(float(u_sent[0]))
         self.att_pub.publish(msg)
+        return u_sent
+
+    def _ref_at(self, step_idx: int) -> np.ndarray:
+        k = int(step_idx)
+        if k < self.entry_steps:
+            return self.x_ref_entry[k].copy()
+        circle_idx = (k - self.entry_steps) % int(self.x_ref_circle_period.shape[0])
+        return self.x_ref_circle_period[circle_idx].copy()
 
     def _ref_window(self, step_idx: int) -> np.ndarray:
-        idx = (np.arange(self.horizon + 1, dtype=int) + int(step_idx)) % int(self.x_ref_period.shape[0])
-        return self.x_ref_period[idx]
-
-    def _pd_position_velocity_command(
-        self,
-        x: np.ndarray,
-        target_pos_ned: np.ndarray,
-        target_vel_ned: Optional[np.ndarray],
-        *,
-        kp_pos_xy: float,
-        kd_vel_xy: float,
-        kp_pos_d: float,
-        kd_vel_d: float,
-        max_tilt_deg: float,
-    ) -> np.ndarray:
-        """Generic PD controller used by pre-align and line-entry stages."""
-        pn_ref, pe_ref, pd_ref = [float(v) for v in target_pos_ned]
-        if target_vel_ned is None:
-            target_vel_ned = np.zeros((3,), dtype=float)
-        vn_ref, ve_ref, vd_ref = [float(v) for v in np.asarray(target_vel_ned).reshape(3)]
-
-        pos_err = np.array([pn_ref - x[0], pe_ref - x[1], pd_ref - x[4]], dtype=float)
-        vel_err = np.array([vn_ref - x[2], ve_ref - x[3], vd_ref - x[5]], dtype=float)
-
-        a_n = kp_pos_xy * pos_err[0] + kd_vel_xy * vel_err[0]
-        a_e = kp_pos_xy * pos_err[1] + kd_vel_xy * vel_err[1]
-        a_d = kp_pos_d * pos_err[2] + kd_vel_d * vel_err[2]
-
-        theta_cmd = float(a_n / max(self.g, 1e-6))
-        phi_cmd = float(a_e / max(self.g, 1e-6))
-        dT_cmd = float(-self.mass_kg * a_d)
-
-        max_tilt = math.radians(max_tilt_deg)
-        phi_cmd = float(np.clip(phi_cmd, -max_tilt, max_tilt))
-        theta_cmd = float(np.clip(theta_cmd, -max_tilt, max_tilt))
-
-        # Keep inside controller and physical limits.
-        dT_cmd = float(np.clip(dT_cmd, self.u_min_base[0], self.u_max_base[0]))
-        phi_cmd = float(np.clip(phi_cmd, self.u_min_base[1], self.u_max_base[1]))
-        theta_cmd = float(np.clip(theta_cmd, self.u_min_base[2], self.u_max_base[2]))
-
-        return np.array([dT_cmd, phi_cmd, theta_cmd], dtype=float)
-
-    def _pre_align_command(
-        self,
-        x: np.ndarray,
-        target_pos_ned: np.ndarray,
-        target_vel_ned: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        return self._pd_position_velocity_command(
-            x=x,
-            target_pos_ned=target_pos_ned,
-            target_vel_ned=target_vel_ned,
-            kp_pos_xy=self.pre_align_kp_pos_xy,
-            kd_vel_xy=self.pre_align_kd_vel_xy,
-            kp_pos_d=self.pre_align_kp_pos_d,
-            kd_vel_d=self.pre_align_kd_vel_d,
-            max_tilt_deg=self.pre_align_max_tilt_deg,
-        )
-
-    def _line_entry_command(
-        self,
-        x: np.ndarray,
-        target_pos_ned: np.ndarray,
-        target_vel_ned: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        return self._pd_position_velocity_command(
-            x=x,
-            target_pos_ned=target_pos_ned,
-            target_vel_ned=target_vel_ned,
-            kp_pos_xy=self.line_entry_kp_pos_xy,
-            kd_vel_xy=self.line_entry_kd_vel_xy,
-            kp_pos_d=self.line_entry_kp_pos_d,
-            kd_vel_d=self.line_entry_kd_vel_d,
-            max_tilt_deg=self.line_entry_max_tilt_deg,
-        )
+        return np.vstack([self._ref_at(int(step_idx) + j) for j in range(self.horizon + 1)])
 
     # --------------------- offboard helpers ---------------------
     def _try_set_offboard_and_arm(self, now: rospy.Time, last_request: rospy.Time) -> rospy.Time:
@@ -595,43 +541,39 @@ class RtmpcGazeboNode:
                 break
             rate.sleep()
 
-        # Prime setpoints for OFFBOARD entry
         rospy.loginfo("[rtmpc_gz] priming attitude setpoints...")
         for _ in range(max(10, int(2.0 * self.rate_hz))):
             self._publish_attitude_cmd(dT=0.0, phi_cmd=0.0, theta_cmd=0.0, yaw_cmd=yaw_cmd)
             rate.sleep()
 
         last_request = rospy.Time.now()
+        ready_since = None
+        rospy.loginfo(
+            "[rtmpc_gz] waiting for OFFBOARD+armed, then %.2fs startup delay before RTMPC clock starts",
+            self.start_delay_sec,
+        )
+        while not rospy.is_shutdown():
+            now = rospy.Time.now()
+            if self.auto_offboard_arm:
+                last_request = self._try_set_offboard_and_arm(now, last_request)
+            ready = (
+                self.current_state is not None
+                and self.current_state.mode == "OFFBOARD"
+                and bool(self.current_state.armed)
+            )
+            if ready:
+                if ready_since is None:
+                    ready_since = now
+                if (now - ready_since).to_sec() >= max(0.0, self.start_delay_sec):
+                    break
+            else:
+                ready_since = None
+            self._publish_attitude_cmd(dT=0.0, phi_cmd=0.0, theta_cmd=0.0, yaw_cmd=yaw_cmd)
+            rate.sleep()
+
         step_idx = 0
         loop_count = 0
-
-        phase = "rtmpc"
-        if self.pre_align_enable:
-            phase = "pre_align_hover" if self.line_entry_enable else "pre_align_direct"
-
-        pre_align_hold_start: Optional[rospy.Time] = None
-        pre_align_t0 = rospy.Time.now()
-        line_entry_hold_start: Optional[rospy.Time] = None
-        line_entry_t0: Optional[rospy.Time] = None
-
-        if phase == "pre_align_hover":
-            rospy.loginfo(
-                "[rtmpc_gz] pre_align_hover start -> staging_ned=(%.3f, %.3f, %.3f), hold=%.2fs",
-                float(self.stage_pos_ned[0]),
-                float(self.stage_pos_ned[1]),
-                float(self.stage_pos_ned[2]),
-                float(self.pre_align_hover_sec),
-            )
-        elif phase == "pre_align_direct":
-            rospy.loginfo(
-                "[rtmpc_gz] pre_align_direct start -> target_ned=(%.3f, %.3f, %.3f), hold=%.2fs",
-                float(self.start_pos_ned[0]),
-                float(self.start_pos_ned[1]),
-                float(self.start_pos_ned[2]),
-                float(self.pre_align_hover_sec),
-            )
-        else:
-            rospy.loginfo("[rtmpc_gz] control loop start (rtmpc)")
+        rospy.loginfo("[rtmpc_gz] control loop start: full-reference RTMPC")
 
         while not rospy.is_shutdown():
             now = rospy.Time.now()
@@ -640,215 +582,24 @@ class RtmpcGazeboNode:
 
             try:
                 x = self._enu_to_ned_state()
-
-                if phase in ("pre_align_hover", "pre_align_direct"):
-                    target_pos = self.stage_pos_ned if phase == "pre_align_hover" else self.start_pos_ned
-                    u_pre = self._pre_align_command(x=x, target_pos_ned=target_pos, target_vel_ned=np.zeros((3,), dtype=float))
-                    pos_err = np.array(
-                        [target_pos[0] - x[0], target_pos[1] - x[1], target_pos[2] - x[4]],
-                        dtype=float,
-                    )
-                    vel_now = np.array([x[2], x[3], x[5]], dtype=float)
-                    pos_ok = float(np.linalg.norm(pos_err)) <= self.pre_align_pos_tol_m
-                    vel_ok = float(np.linalg.norm(vel_now)) <= self.pre_align_vel_tol_mps
-                    if pos_ok and vel_ok:
-                        if pre_align_hold_start is None:
-                            pre_align_hold_start = now
-                        hold_elapsed = (now - pre_align_hold_start).to_sec()
-                    else:
-                        pre_align_hold_start = None
-                        hold_elapsed = 0.0
-
-                    self._publish_attitude_cmd(
-                        dT=float(u_pre[0]),
-                        phi_cmd=float(u_pre[1]),
-                        theta_cmd=float(u_pre[2]),
-                        yaw_cmd=yaw_cmd,
-                    )
-
-                    pos_err_n = float(pos_err[0])
-                    pos_err_e = float(pos_err[1])
-                    pos_err_d = float(pos_err[2])
-                    vel_err_n = float(-x[2])
-                    vel_err_e = float(-x[3])
-                    vel_err_d = float(-x[5])
-                    fail_reason = self._diag_fail_reason(pos_ok=bool(pos_ok), vel_ok=bool(vel_ok), att_ok=True)
-                    self._diag_log(
-                        now=now,
-                        phase=phase,
-                        x=x,
-                        target_pos_ned=target_pos,
-                        target_vel_ned=np.zeros((3,), dtype=float),
-                        pos_ok=bool(pos_ok),
-                        vel_ok=bool(vel_ok),
-                        att_ok=True,
-                        hold_elapsed=float(hold_elapsed),
-                        hold_required=float(self.pre_align_hover_sec),
-                        u_cmd=u_pre,
-                        fail_reason=fail_reason,
-                    )
-
-                    if loop_count % max(1, int(self.rate_hz)) == 0:
-                        rospy.loginfo(
-                            "[rtmpc_gz][%s] pos_err=(%.3f,%.3f,%.3f) vel_err=(%.3f,%.3f,%.3f) hold=%.2f/%.2f fail=%s",
-                            phase,
-                            pos_err_n,
-                            pos_err_e,
-                            pos_err_d,
-                            vel_err_n,
-                            vel_err_e,
-                            vel_err_d,
-                            float(hold_elapsed),
-                            float(self.pre_align_hover_sec),
-                            fail_reason,
-                        )
-
-                    if hold_elapsed >= self.pre_align_hover_sec:
-                        if phase == "pre_align_hover":
-                            phase = "line_entry"
-                            line_entry_t0 = now
-                            line_entry_hold_start = None
-                            rospy.loginfo(
-                                "[rtmpc_gz] pre_align_hover finished -> line_entry; start_ned=(%.3f, %.3f, %.3f), v_ref=(%.3f, %.3f, %.3f)",
-                                float(self.start_pos_ned[0]),
-                                float(self.start_pos_ned[1]),
-                                float(self.start_pos_ned[2]),
-                                float(self.start_vel_ned[0]),
-                                float(self.start_vel_ned[1]),
-                                float(self.start_vel_ned[2]),
-                            )
-                        else:
-                            phase = "rtmpc"
-                            step_idx = 0
-                            rospy.loginfo("[rtmpc_gz] pre_align_direct finished, switch to RTMPC")
-                        continue
-
-                    if self.pre_align_timeout_sec > 0.0:
-                        elapsed = (now - pre_align_t0).to_sec()
-                        if elapsed >= self.pre_align_timeout_sec:
-                            if self.pre_align_force_start_on_timeout:
-                                if phase == "pre_align_hover":
-                                    phase = "line_entry"
-                                    line_entry_t0 = now
-                                    line_entry_hold_start = None
-                                    rospy.logwarn("[rtmpc_gz] pre_align timeout, force switch to line_entry")
-                                else:
-                                    phase = "rtmpc"
-                                    step_idx = 0
-                                    rospy.logwarn("[rtmpc_gz] pre_align timeout, force switch to RTMPC")
-                            else:
-                                rospy.logwarn_throttle(2.0, "[rtmpc_gz] pre_align timeout reached but still not settled")
-                    loop_count += 1
-                    continue
-
-                if phase == "line_entry":
-                    u_line = self._line_entry_command(
-                        x=x,
-                        target_pos_ned=self.start_pos_ned,
-                        target_vel_ned=self.start_vel_ned,
-                    )
-
-                    pos_err_n = float(self.start_pos_ned[0] - x[0])
-                    pos_err_e = float(self.start_pos_ned[1] - x[1])
-                    pos_err_d = float(self.start_pos_ned[2] - x[4])
-                    vel_err_n = float(self.start_vel_ned[0] - x[2])
-                    vel_err_e = float(self.start_vel_ned[1] - x[3])
-                    vel_err_d = float(self.start_vel_ned[2] - x[5])
-
-                    pos_ok = (
-                        abs(pos_err_n) <= self.line_entry_pos_tol_n_m
-                        and abs(pos_err_e) <= self.line_entry_pos_tol_e_m
-                        and abs(pos_err_d) <= self.line_entry_pos_tol_d_m
-                    )
-                    vel_ok = (
-                        abs(vel_err_n) <= self.line_entry_vel_tol_n_mps
-                        and abs(vel_err_e) <= self.line_entry_vel_tol_e_mps
-                        and abs(vel_err_d) <= self.line_entry_vel_tol_d_mps
-                    )
-                    att_ok = abs(float(x[6])) <= self.line_entry_att_tol_rad and abs(float(x[7])) <= self.line_entry_att_tol_rad
-
-                    if pos_ok and vel_ok and att_ok:
-                        if line_entry_hold_start is None:
-                            line_entry_hold_start = now
-                        hold_elapsed = (now - line_entry_hold_start).to_sec()
-                    else:
-                        line_entry_hold_start = None
-                        hold_elapsed = 0.0
-
-                    self._publish_attitude_cmd(
-                        dT=float(u_line[0]),
-                        phi_cmd=float(u_line[1]),
-                        theta_cmd=float(u_line[2]),
-                        yaw_cmd=yaw_cmd,
-                    )
-
-                    fail_reason = self._diag_fail_reason(pos_ok=bool(pos_ok), vel_ok=bool(vel_ok), att_ok=bool(att_ok))
-                    self._diag_log(
-                        now=now,
-                        phase=phase,
-                        x=x,
-                        target_pos_ned=self.start_pos_ned,
-                        target_vel_ned=self.start_vel_ned,
-                        pos_ok=bool(pos_ok),
-                        vel_ok=bool(vel_ok),
-                        att_ok=bool(att_ok),
-                        hold_elapsed=float(hold_elapsed),
-                        hold_required=float(self.line_entry_hold_sec),
-                        u_cmd=u_line,
-                        fail_reason=fail_reason,
-                    )
-
-                    if loop_count % max(1, int(self.rate_hz)) == 0:
-                        rospy.loginfo(
-                            "[rtmpc_gz][line_entry] pos_err=(%.3f,%.3f,%.3f) vel_err=(%.3f,%.3f,%.3f) att=(%.3f,%.3f) hold=%.2f/%.2f fail=%s",
-                            pos_err_n,
-                            pos_err_e,
-                            pos_err_d,
-                            vel_err_n,
-                            vel_err_e,
-                            vel_err_d,
-                            float(x[6]),
-                            float(x[7]),
-                            float(hold_elapsed),
-                            float(self.line_entry_hold_sec),
-                            fail_reason,
-                        )
-
-                    if pos_ok and vel_ok and att_ok and (hold_elapsed >= self.line_entry_hold_sec):
-                        can_switch = True
-                        feas_detail = "disabled"
-                        if self.line_entry_require_qp_feasible:
-                            can_switch, feas_detail = self._line_entry_qp_initial_feasible(x)
-
-                        if can_switch:
-                            phase = "rtmpc"
-                            step_idx = 0
-                            rospy.loginfo("[rtmpc_gz] line_entry finished, switch to RTMPC")
-                            continue
-
-                        rospy.logwarn_throttle(1.0, "[rtmpc_gz] line_entry gate blocked by qp-feasibility: %s", feas_detail)
-
-                    if self.line_entry_timeout_sec > 0.0 and line_entry_t0 is not None:
-                        elapsed = (now - line_entry_t0).to_sec()
-                        if elapsed >= self.line_entry_timeout_sec:
-                            if self.line_entry_force_start_on_timeout:
-                                phase = "rtmpc"
-                                step_idx = 0
-                                rospy.logwarn("[rtmpc_gz] line_entry timeout, force switch to RTMPC")
-                            else:
-                                rospy.logwarn_throttle(2.0, "[rtmpc_gz] line_entry timeout reached but criteria not met")
-                    loop_count += 1
-                    continue
-
                 x_des = self._ref_window(step_idx)
+                rtmpc_phase = "rtmpc_entry" if step_idx < self.entry_steps else "rtmpc_circle"
+                if rtmpc_phase == "rtmpc_entry":
+                    Qx_solve = self.Qx_entry
+                    Ru_solve = self.Ru_entry
+                    Px_solve = self.Px_entry
+                else:
+                    Qx_solve = self.Qx
+                    Ru_solve = self.Ru
+                    Px_solve = self.Px
 
-                if self.use_gp and self.gp_model is not None:
+                if self.use_gp and self.gp_model is not None and rtmpc_phase == "rtmpc_circle":
                     Xbar, Ubar, _, _ = solve_rtmc_qp_with_gp_stagewise(
                         A=self.A,
                         B=self.B,
-                        Qx=self.Qx,
-                        Ru=self.Ru,
-                        Px=self.Px,
+                        Qx=Qx_solve,
+                        Ru=Ru_solve,
+                        Px=Px_solve,
                         x_meas=x,
                         x_des=x_des,
                         N=self.horizon,
@@ -863,9 +614,9 @@ class RtmpcGazeboNode:
                     Xbar, Ubar = solve_rtmc_qp_paper(
                         A=self.A,
                         B=self.B,
-                        Qx=self.Qx,
-                        Ru=self.Ru,
-                        Px=self.Px,
+                        Qx=Qx_solve,
+                        Ru=Ru_solve,
+                        Px=Px_solve,
                         x_meas=x,
                         x_des=x_des,
                         N=self.horizon,
@@ -877,41 +628,38 @@ class RtmpcGazeboNode:
 
                 x_bar = Xbar[0]
                 u_bar = Ubar[0]
-                u = u_bar + self.K @ (x - x_bar)
-                u = np.clip(u, self.u_min_base, self.u_max_base)
+                u_raw = u_bar + self.K @ (x - x_bar)
+                u_clipped = np.clip(u_raw, self.u_min_base, self.u_max_base)
 
-                self._publish_attitude_cmd(
-                    dT=float(u[0]),
-                    phi_cmd=float(u[1]),
-                    theta_cmd=float(u[2]),
+                u_sent = self._publish_attitude_cmd(
+                    dT=float(u_clipped[0]),
+                    phi_cmd=float(u_clipped[1]),
+                    theta_cmd=float(u_clipped[2]),
                     yaw_cmd=yaw_cmd,
                 )
 
                 err = x[:6] - x_des[0, :6]
                 self._diag_log(
                     now=now,
-                    phase=phase,
+                    phase=rtmpc_phase,
                     x=x,
                     target_pos_ned=x_des[0, [0, 1, 4]],
                     target_vel_ned=x_des[0, [2, 3, 5]],
-                    pos_ok=None,
-                    vel_ok=None,
-                    att_ok=None,
-                    hold_elapsed=None,
-                    hold_required=None,
-                    u_cmd=u,
+                    u_cmd=u_sent,
                     fail_reason="tracking",
+                    u_raw=u_clipped,
                 )
 
                 if step_idx % max(1, int(self.rate_hz)) == 0:
                     rospy.loginfo(
-                        "[rtmpc_gz][rtmpc] k=%d |pos_err|=%.3f |vel_err|=%.3f dT=%.3f phi=%.3f th=%.3f",
+                        "[rtmpc_gz][%s] k=%d |pos_err|=%.3f |vel_err|=%.3f dT=%.3f phi=%.3f th=%.3f",
+                        rtmpc_phase,
                         step_idx,
                         float(np.linalg.norm(err[[0, 1, 4]])),
                         float(np.linalg.norm(err[[2, 3, 5]])),
-                        float(u[0]),
-                        float(u[1]),
-                        float(u[2]),
+                        float(u_sent[0]),
+                        float(u_sent[1]),
+                        float(u_sent[2]),
                     )
 
                 step_idx += 1

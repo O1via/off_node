@@ -43,3 +43,4 @@ src/data_system_identification/
 # Workspace root helper files
 src/.cache/
 src/CMakeLists.txt
+src/off_node/diag_outputs/
