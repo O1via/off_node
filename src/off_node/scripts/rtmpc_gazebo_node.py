@@ -19,12 +19,13 @@ import csv
 import math
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import rospy
 import tf.transformations as tft
-from geometry_msgs.msg import PoseStamped, TwistStamped
+from geometry_msgs.msg import Point, PoseStamped, TwistStamped, Wrench
+from gazebo_msgs.srv import ApplyBodyWrench
 from mavros_msgs.msg import AttitudeTarget, State
 from mavros_msgs.srv import CommandBool, SetMode
 
@@ -32,6 +33,8 @@ from mavros_msgs.srv import CommandBool, SetMode
 WORK_PY = Path("/home/zxy/work/py")
 if WORK_PY.exists() and str(WORK_PY) not in sys.path:
     sys.path.insert(0, str(WORK_PY))
+
+DEFAULT_TORCH_SITE = Path("/home/zxy/work/.venv/lib/python3.8/site-packages")
 
 from gp_residual_model import VelocityResidualGP, residual_shrink_bounds  # noqa: E402
 from rtmpc_constants import (  # noqa: E402
@@ -54,6 +57,41 @@ from rtmpc_demo import (  # noqa: E402
 )
 
 
+def _import_torch(torch_site: str):
+    try:
+        import torch  # type: ignore
+        from torch import nn  # type: ignore
+        return torch, nn
+    except Exception as first_exc:
+        site = Path(torch_site).expanduser()
+        if site.exists() and str(site) not in sys.path:
+            sys.path.insert(0, str(site))
+        try:
+            import torch  # type: ignore
+            from torch import nn  # type: ignore
+            return torch, nn
+        except Exception as second_exc:
+            raise RuntimeError(
+                "controller_mode=policy requires torch. "
+                f"Tried normal import and torch_site={site}. "
+                f"Errors: {first_exc!r}; {second_exc!r}"
+            ) from second_exc
+
+
+def _build_mlp(nn, input_dim: int, output_dim: int, hidden: Tuple[int, ...]):
+    layers = []
+    dims = (int(input_dim), *tuple(int(h) for h in hidden), int(output_dim))
+    for i in range(len(dims) - 1):
+        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        if i < len(dims) - 2:
+            layers.append(nn.ReLU())
+    return nn.Sequential(*layers)
+
+
+def _make_policy_input(x: np.ndarray, x_des_window: np.ndarray) -> np.ndarray:
+    return np.concatenate([np.asarray(x, dtype=float).reshape(-1), np.asarray(x_des_window, dtype=float).reshape(-1)])
+
+
 class RtmpcGazeboNode:
     def __init__(self) -> None:
         # --------------------- Parameters ---------------------
@@ -64,6 +102,16 @@ class RtmpcGazeboNode:
         self.auto_offboard_arm = bool(rospy.get_param("~auto_offboard_arm", True))
         self.start_delay_sec = float(rospy.get_param("~start_delay_sec", 1.0))
         self.yaw_deg = float(rospy.get_param("~yaw_deg", 90.0))
+
+        # Controller mode: RTMPC expert or learned DAgger policy.
+        self.controller_mode = str(rospy.get_param("~controller_mode", "rtmpc")).strip().lower()
+        if self.controller_mode not in ("rtmpc", "policy"):
+            raise ValueError("controller_mode must be 'rtmpc' or 'policy'")
+        self.policy_checkpoint_path = str(
+            rospy.get_param("~policy_checkpoint_path", "/home/zxy/work/dagger_runs/policy_cycle_08.pt")
+        )
+        self.policy_device = str(rospy.get_param("~policy_device", "cpu"))
+        self.policy_torch_site = str(rospy.get_param("~policy_torch_site", str(DEFAULT_TORCH_SITE)))
 
         # Full reference task, aligned with py/rtmpc_demo.py takeoff_circle mode.
         self.takeoff_start_ned = np.asarray(
@@ -95,6 +143,40 @@ class RtmpcGazeboNode:
         self.disturbance_mode = str(rospy.get_param("~disturbance_mode", "force_only"))
         self.force_bound_mg = float(rospy.get_param("~force_bound_mg", 0.0))
         self.force_d_axis_scale = float(rospy.get_param("~force_d_axis_scale", 0.15))
+
+        # Optional physical force injection in Gazebo. force_bound_mg above always
+        # defines the RTMPC design bound; this block controls whether an actual
+        # external wrench is applied to the simulated vehicle.
+        self.disturbance_apply_enable = bool(rospy.get_param("~disturbance_apply_enable", False))
+        self.disturbance_apply_only_circle = bool(rospy.get_param("~disturbance_apply_only_circle", True))
+        self.disturbance_apply_force_bound_mg = float(
+            rospy.get_param("~disturbance_apply_force_bound_mg", -1.0)
+        )
+        # Number of short wind-gust events to apply in each circular lap.
+        # For the default value 2, events are triggered near 1/4 and 3/4 of each lap.
+        self.disturbance_events_per_circle = int(rospy.get_param("~disturbance_events_per_circle", 2))
+        self.disturbance_update_sec = float(rospy.get_param("~disturbance_update_sec", 0.5))  # legacy continuous mode parameter
+        self.disturbance_seed = int(rospy.get_param("~disturbance_seed", 1))
+        self.disturbance_body_name = str(rospy.get_param("~disturbance_body_name", "iris::base_link"))
+        self.disturbance_reference_frame = str(rospy.get_param("~disturbance_reference_frame", "world"))
+        self.disturbance_duration_sec = float(rospy.get_param("~disturbance_duration_sec", 0.25))
+        self.disturbance_log_hz = float(rospy.get_param("~disturbance_log_hz", 1.0))
+        self.disturbance_direction_mode = str(rospy.get_param("~disturbance_direction_mode", "random")).strip().lower()
+        self.disturbance_force_direction_ned = np.asarray(
+            rospy.get_param("~disturbance_force_direction_ned", [0.0, 1.0, 0.0]),
+            dtype=float,
+        ).reshape(3)
+        if self.disturbance_direction_mode not in ("random", "fixed_ned"):
+            raise ValueError("disturbance_direction_mode must be 'random' or 'fixed_ned'")
+        self._disturbance_rng = np.random.default_rng(self.disturbance_seed)
+        self._disturbance_force_ned = np.zeros((3,), dtype=float)
+        self._disturbance_next_update = rospy.Time(0)
+        self._disturbance_last_log = rospy.Time(0)
+        self._disturbance_triggered_events = set()
+        self._disturbance_active_until = rospy.Time(0)
+        self._disturbance_event_id = -1
+        self._disturbance_lap_idx = -1
+        self._disturbance_event_idx = -1
 
         # GP options. The RTMPC controller runs throughout the trajectory; GP mean
         # compensation is only applied after the entry segment, where training data is in-distribution.
@@ -153,6 +235,21 @@ class RtmpcGazeboNode:
         self.att_pub = rospy.Publisher(self.att_sp_topic, AttitudeTarget, queue_size=50)
         self.arming_client = rospy.ServiceProxy("mavros/cmd/arming", CommandBool)
         self.mode_client = rospy.ServiceProxy("mavros/set_mode", SetMode)
+        self.apply_wrench_client = None
+        if self.disturbance_apply_enable:
+            service_name = "gazebo/apply_body_wrench"
+            try:
+                rospy.wait_for_service(service_name, timeout=5.0)
+                self.apply_wrench_client = rospy.ServiceProxy(service_name, ApplyBodyWrench)
+                rospy.loginfo(
+                    "[rtmpc_gz] gazebo wrench disturbance enabled: body=%s, frame=%s, update=%.2fs",
+                    self.disturbance_body_name,
+                    self.disturbance_reference_frame,
+                    self.disturbance_update_sec,
+                )
+            except Exception as exc:
+                rospy.logwarn("[rtmpc_gz] failed to connect %s: %s", service_name, str(exc))
+                self.disturbance_apply_enable = False
 
         # --------------------- RTMPC init ---------------------
         self.dynamics = "iris_linear"
@@ -176,11 +273,15 @@ class RtmpcGazeboNode:
         self._expand_state_bounds_for_full_reference()
 
         self.gp_model: Optional[VelocityResidualGP] = None
+        self.policy_model = None
+        self.policy_torch = None
         self._prepare_tube_and_bounds()
         self._prepare_reference()
+        self._prepare_policy_if_needed()
         self._init_diag_logger()
 
         rospy.loginfo("[rtmpc_gz] init done")
+        rospy.loginfo("[rtmpc_gz] controller_mode=%s", self.controller_mode)
         rospy.loginfo(
             "[rtmpc_gz] dt=%.3f, horizon=%d, entry_steps=%d, radius=%.2f, period=%d",
             self.dt,
@@ -317,6 +418,74 @@ class RtmpcGazeboNode:
             int(self.circle_period_steps),
         )
 
+    def _prepare_policy_if_needed(self) -> None:
+        if self.controller_mode != "policy":
+            return
+
+        torch, nn = _import_torch(self.policy_torch_site)
+        ckpt_path = Path(self.policy_checkpoint_path).expanduser()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"policy checkpoint not found: {ckpt_path}")
+        ckpt: Dict = torch.load(str(ckpt_path), map_location="cpu")
+        if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
+            raise ValueError(f"invalid policy checkpoint format: {ckpt_path}")
+
+        hidden = tuple(int(h) for h in ckpt.get("hidden", (64, 64)))
+        input_dim = int(ckpt.get("input_dim", self.n + (self.horizon + 1) * self.n))
+        output_dim = int(ckpt.get("output_dim", self.m))
+        expected_input_dim = int(self.n + (self.horizon + 1) * self.n)
+        if input_dim != expected_input_dim:
+            raise ValueError(
+                f"policy input_dim mismatch: checkpoint={input_dim}, current={expected_input_dim}. "
+                "Check horizon/state dimension."
+            )
+        if output_dim != self.m:
+            raise ValueError(f"policy output_dim mismatch: checkpoint={output_dim}, current={self.m}")
+
+        checks = {
+            "reference_mode": "takeoff_circle",
+            "entry_steps": int(self.entry_steps),
+            "reference_altitude_m": float(self.reference_altitude_m),
+            "circle_radius": float(self.circle_radius),
+            "circle_period_steps": int(self.circle_period_steps),
+        }
+        for key, expected in checks.items():
+            if key not in ckpt:
+                rospy.logwarn("[rtmpc_gz][policy] checkpoint missing metadata: %s", key)
+                continue
+            got = ckpt[key]
+            if isinstance(expected, float):
+                if abs(float(got) - expected) > 1e-9:
+                    raise ValueError(f"policy checkpoint {key} mismatch: checkpoint={got}, current={expected}")
+            else:
+                if got != expected:
+                    raise ValueError(f"policy checkpoint {key} mismatch: checkpoint={got}, current={expected}")
+
+        model = _build_mlp(nn, input_dim=input_dim, output_dim=output_dim, hidden=hidden)
+        model.load_state_dict(ckpt["state_dict"], strict=True)
+        model.eval()
+        if self.policy_device != "cpu":
+            model.to(self.policy_device)
+        self.policy_model = model
+        self.policy_torch = torch
+        rospy.loginfo(
+            "[rtmpc_gz][policy] loaded checkpoint=%s input_dim=%d output_dim=%d hidden=%s device=%s",
+            str(ckpt_path),
+            input_dim,
+            output_dim,
+            hidden,
+            self.policy_device,
+        )
+
+    def _policy_action(self, x: np.ndarray, x_des: np.ndarray) -> np.ndarray:
+        if self.policy_model is None or self.policy_torch is None:
+            raise RuntimeError("policy model is not loaded")
+        inp = _make_policy_input(x, x_des)
+        with self.policy_torch.no_grad():
+            xb = self.policy_torch.as_tensor(inp, dtype=self.policy_torch.float32, device=self.policy_device).reshape(1, -1)
+            ub = self.policy_model(xb).reshape(-1)
+        return ub.detach().cpu().numpy()
+
     # --------------------- callbacks ---------------------
     def _state_cb(self, msg: State) -> None:
         self.current_state = msg
@@ -344,6 +513,7 @@ class RtmpcGazeboNode:
             [
                 "t",
                 "phase",
+                "step_idx",
                 "pn", "pe", "pd", "vn", "ve", "vd", "phi", "theta",
                 "target_pn", "target_pe", "target_pd",
                 "target_vn", "target_ve", "target_vd",
@@ -351,6 +521,8 @@ class RtmpcGazeboNode:
                 "vel_err_n", "vel_err_e", "vel_err_d",
                 "u_dT", "u_phi", "u_theta",
                 "u_raw_dT", "u_raw_phi", "u_raw_theta",
+                "disturbance_active", "disturbance_event_id", "disturbance_lap", "disturbance_event_idx",
+                "disturbance_fn", "disturbance_fe", "disturbance_fd",
                 "fail_reason",
             ]
         )
@@ -382,6 +554,7 @@ class RtmpcGazeboNode:
         u_cmd: Optional[np.ndarray],
         fail_reason: str,
         u_raw: Optional[np.ndarray] = None,
+        step_idx: Optional[int] = None,
     ) -> None:
         if (not self.diag_enable) or (self._diag_writer is None):
             return
@@ -403,10 +576,15 @@ class RtmpcGazeboNode:
         if u_raw is not None:
             raw = np.asarray(u_raw, dtype=float).reshape(3)
 
+        active = bool(self.disturbance_apply_enable and now <= self._disturbance_active_until)
+        force = self._disturbance_force_ned if active else np.zeros(3, dtype=float)
+        diag_step = -1 if step_idx is None else int(step_idx)
+
         self._diag_writer.writerow(
             [
                 t_now,
                 phase,
+                diag_step,
                 float(x[0]), float(x[1]), float(x[4]),
                 float(x[2]), float(x[3]), float(x[5]),
                 float(x[6]), float(x[7]),
@@ -416,6 +594,11 @@ class RtmpcGazeboNode:
                 float(vel_e[0]), float(vel_e[1]), float(vel_e[2]),
                 float(u[0]), float(u[1]), float(u[2]),
                 float(raw[0]), float(raw[1]), float(raw[2]),
+                int(active),
+                int(self._disturbance_event_id if active else -1),
+                int(self._disturbance_lap_idx if active else -1),
+                int(self._disturbance_event_idx if active else -1),
+                float(force[0]), float(force[1]), float(force[2]),
                 fail_reason,
             ]
         )
@@ -512,6 +695,121 @@ class RtmpcGazeboNode:
     def _ref_window(self, step_idx: int) -> np.ndarray:
         return np.vstack([self._ref_at(int(step_idx) + j) for j in range(self.horizon + 1)])
 
+
+    # --------------------- Gazebo disturbance helpers ---------------------
+    def _sample_disturbance_force_ned(self) -> np.ndarray:
+        bound_mg = self.disturbance_apply_force_bound_mg
+        if bound_mg < 0.0:
+            bound_mg = self.force_bound_mg
+        bound_mg = max(0.0, float(bound_mg))
+        fmax = bound_mg * self.mass_kg * self.g
+        if fmax <= 0.0:
+            return np.zeros(3, dtype=float)
+
+        if self.disturbance_direction_mode == "fixed_ned":
+            direction = np.asarray(self.disturbance_force_direction_ned, dtype=float).reshape(3)
+            norm = float(np.linalg.norm(direction))
+            if norm <= 1e-9:
+                rospy.logwarn_throttle(2.0, "[rtmpc_gz] fixed disturbance direction is zero; no force applied")
+                return np.zeros(3, dtype=float)
+            return fmax * direction / norm
+
+        f_axis = fmax / np.sqrt(3.0)
+        f_axis_d = f_axis * float(min(max(self.force_d_axis_scale, 0.0), 1.0))
+        return np.array(
+            [
+                self._disturbance_rng.uniform(-f_axis, f_axis),
+                self._disturbance_rng.uniform(-f_axis, f_axis),
+                self._disturbance_rng.uniform(-f_axis_d, f_axis_d),
+            ],
+            dtype=float,
+        )
+
+    def _circle_disturbance_event_index(self, step_idx: int) -> Optional[int]:
+        events = int(self.disturbance_events_per_circle)
+        if events <= 0 or self.circle_period_steps <= 0 or step_idx < self.entry_steps:
+            return None
+
+        circle_step = int(step_idx - self.entry_steps) % int(self.circle_period_steps)
+        event_steps = [
+            int(round((i + 0.5) * float(self.circle_period_steps) / float(events)))
+            for i in range(events)
+        ]
+        for event_idx, event_step in enumerate(event_steps):
+            event_step = min(max(event_step, 0), int(self.circle_period_steps) - 1)
+            if circle_step == event_step:
+                return event_idx
+        return None
+
+    def _apply_gazebo_disturbance(self, phase: str, now: rospy.Time, step_idx: int) -> None:
+        if not self.disturbance_apply_enable or self.apply_wrench_client is None:
+            return
+        if self.disturbance_apply_only_circle and phase != "rtmpc_circle":
+            return
+
+        if phase == "rtmpc_circle":
+            event_idx = self._circle_disturbance_event_index(step_idx)
+            if event_idx is None:
+                return
+            lap_idx = int(step_idx - self.entry_steps) // int(self.circle_period_steps)
+            event_key = (lap_idx, event_idx)
+            if event_key in self._disturbance_triggered_events:
+                return
+            self._disturbance_triggered_events.add(event_key)
+            self._disturbance_force_ned = self._sample_disturbance_force_ned()
+            self._disturbance_event_id += 1
+            self._disturbance_lap_idx = int(lap_idx)
+            self._disturbance_event_idx = int(event_idx)
+        else:
+            # Legacy fallback for non-circle disturbance experiments.
+            update_sec = max(float(self.disturbance_update_sec), float(self.dt))
+            if now < self._disturbance_next_update:
+                return
+            self._disturbance_force_ned = self._sample_disturbance_force_ned()
+            self._disturbance_next_update = now + rospy.Duration(update_sec)
+            self._disturbance_event_id += 1
+            self._disturbance_lap_idx = -1
+            self._disturbance_event_idx = -1
+
+        # NED force [Fn, Fe, Fd] -> Gazebo ENU world force [Fx=Fe, Fy=Fn, Fz=-Fd].
+        fn, fe, fd = [float(v) for v in self._disturbance_force_ned]
+        wrench = Wrench()
+        wrench.force.x = fe
+        wrench.force.y = fn
+        wrench.force.z = -fd
+        duration = rospy.Duration(max(float(self.disturbance_duration_sec), 2.0 / max(self.rate_hz, 1e-6)))
+        try:
+            self.apply_wrench_client(
+                body_name=self.disturbance_body_name,
+                reference_frame=self.disturbance_reference_frame,
+                reference_point=Point(0.0, 0.0, 0.0),
+                wrench=wrench,
+                start_time=rospy.Time(0),
+                duration=duration,
+            )
+            self._disturbance_active_until = now + duration
+        except Exception as exc:
+            rospy.logwarn_throttle(1.0, "[rtmpc_gz] apply_body_wrench failed: %s", str(exc))
+            return
+
+        self._disturbance_last_log = now
+        rospy.loginfo(
+            "[rtmpc_gz][disturbance] id=%d lap=%d event=%d mode=%s phase=%s step=%d F_ned=(%.3f, %.3f, %.3f)N F_enu=(%.3f, %.3f, %.3f)N duration=%.2fs",
+            int(self._disturbance_event_id),
+            int(self._disturbance_lap_idx),
+            int(self._disturbance_event_idx),
+            self.disturbance_direction_mode,
+            phase,
+            int(step_idx),
+            fn,
+            fe,
+            fd,
+            fe,
+            fn,
+            -fd,
+            float(duration.to_sec()),
+        )
+
     # --------------------- offboard helpers ---------------------
     def _try_set_offboard_and_arm(self, now: rospy.Time, last_request: rospy.Time) -> rospy.Time:
         if self.current_state is None:
@@ -573,7 +871,7 @@ class RtmpcGazeboNode:
 
         step_idx = 0
         loop_count = 0
-        rospy.loginfo("[rtmpc_gz] control loop start: full-reference RTMPC")
+        rospy.loginfo("[rtmpc_gz] control loop start: full-reference %s", self.controller_mode.upper())
 
         while not rospy.is_shutdown():
             now = rospy.Time.now()
@@ -584,52 +882,57 @@ class RtmpcGazeboNode:
                 x = self._enu_to_ned_state()
                 x_des = self._ref_window(step_idx)
                 rtmpc_phase = "rtmpc_entry" if step_idx < self.entry_steps else "rtmpc_circle"
-                if rtmpc_phase == "rtmpc_entry":
-                    Qx_solve = self.Qx_entry
-                    Ru_solve = self.Ru_entry
-                    Px_solve = self.Px_entry
+                self._apply_gazebo_disturbance(rtmpc_phase, now, step_idx)
+                if self.controller_mode == "policy":
+                    u_raw = self._policy_action(x, x_des)
+                    u_clipped = np.clip(u_raw, self.u_min_base, self.u_max_base)
                 else:
-                    Qx_solve = self.Qx
-                    Ru_solve = self.Ru
-                    Px_solve = self.Px
+                    if rtmpc_phase == "rtmpc_entry":
+                        Qx_solve = self.Qx_entry
+                        Ru_solve = self.Ru_entry
+                        Px_solve = self.Px_entry
+                    else:
+                        Qx_solve = self.Qx
+                        Ru_solve = self.Ru
+                        Px_solve = self.Px
 
-                if self.use_gp and self.gp_model is not None and rtmpc_phase == "rtmpc_circle":
-                    Xbar, Ubar, _, _ = solve_rtmc_qp_with_gp_stagewise(
-                        A=self.A,
-                        B=self.B,
-                        Qx=Qx_solve,
-                        Ru=Ru_solve,
-                        Px=Px_solve,
-                        x_meas=x,
-                        x_des=x_des,
-                        N=self.horizon,
-                        z_half=self.z_half,
-                        x_bounds=(self.x_min_t, self.x_max_t),
-                        u_bounds=(self.u_min_t, self.u_max_t),
-                        gp_model=self.gp_model,
-                        gp_beta_sigma=self.gp_beta_sigma,
-                        stagewise_refine_steps=self.gp_stagewise_refine_steps,
-                    )
-                else:
-                    Xbar, Ubar = solve_rtmc_qp_paper(
-                        A=self.A,
-                        B=self.B,
-                        Qx=Qx_solve,
-                        Ru=Ru_solve,
-                        Px=Px_solve,
-                        x_meas=x,
-                        x_des=x_des,
-                        N=self.horizon,
-                        z_half=self.z_half,
-                        x_bounds=(self.x_min_t, self.x_max_t),
-                        u_bounds=(self.u_min_t, self.u_max_t),
-                        d_affine=None,
-                    )
+                    if self.use_gp and self.gp_model is not None and rtmpc_phase == "rtmpc_circle":
+                        Xbar, Ubar, _, _ = solve_rtmc_qp_with_gp_stagewise(
+                            A=self.A,
+                            B=self.B,
+                            Qx=Qx_solve,
+                            Ru=Ru_solve,
+                            Px=Px_solve,
+                            x_meas=x,
+                            x_des=x_des,
+                            N=self.horizon,
+                            z_half=self.z_half,
+                            x_bounds=(self.x_min_t, self.x_max_t),
+                            u_bounds=(self.u_min_t, self.u_max_t),
+                            gp_model=self.gp_model,
+                            gp_beta_sigma=self.gp_beta_sigma,
+                            stagewise_refine_steps=self.gp_stagewise_refine_steps,
+                        )
+                    else:
+                        Xbar, Ubar = solve_rtmc_qp_paper(
+                            A=self.A,
+                            B=self.B,
+                            Qx=Qx_solve,
+                            Ru=Ru_solve,
+                            Px=Px_solve,
+                            x_meas=x,
+                            x_des=x_des,
+                            N=self.horizon,
+                            z_half=self.z_half,
+                            x_bounds=(self.x_min_t, self.x_max_t),
+                            u_bounds=(self.u_min_t, self.u_max_t),
+                            d_affine=None,
+                        )
 
-                x_bar = Xbar[0]
-                u_bar = Ubar[0]
-                u_raw = u_bar + self.K @ (x - x_bar)
-                u_clipped = np.clip(u_raw, self.u_min_base, self.u_max_base)
+                    x_bar = Xbar[0]
+                    u_bar = Ubar[0]
+                    u_raw = u_bar + self.K @ (x - x_bar)
+                    u_clipped = np.clip(u_raw, self.u_min_base, self.u_max_base)
 
                 u_sent = self._publish_attitude_cmd(
                     dT=float(u_clipped[0]),
@@ -647,7 +950,8 @@ class RtmpcGazeboNode:
                     target_vel_ned=x_des[0, [2, 3, 5]],
                     u_cmd=u_sent,
                     fail_reason="tracking",
-                    u_raw=u_clipped,
+                    u_raw=u_raw,
+                    step_idx=step_idx,
                 )
 
                 if step_idx % max(1, int(self.rate_hz)) == 0:

@@ -10,6 +10,12 @@ auto_offboard_arm: true
 start_delay_sec: 1.0
 yaw_deg: 90.0
 
+# Controller mode. Use rtmpc for expert/QP control, policy for the DAgger neural policy.
+controller_mode: rtmpc
+policy_checkpoint_path: /home/zxy/work/dagger_runs/policy_cycle_08.pt
+policy_device: cpu
+policy_torch_site: /home/zxy/work/.venv/lib/python3.8/site-packages
+
 # Full reference task: takeoff/entry segment + circle segment
 # NED: [pn, pe, pd]. This must match SITL spawn ENU [x=pe, y=pn, z=-pd].
 takeoff_start_ned: [0.0, 0.0, 0.0]
@@ -22,12 +28,27 @@ tracking_profile: high_speed_extension
 
 # Takeoff/entry QP objective scaling. Circle tracking still uses nominal weights.
 entry_q_scale: 0.5
-entry_r_scale: 3.0
+entry_r_scale: 2.5
 
-# Disturbance / tube
+# Disturbance / tube design bound
 disturbance_mode: force_only
-force_bound_mg: 0.05
+force_bound_mg: 0.0
 force_d_axis_scale: 0.15
+
+# Optional physical disturbance injection in Gazebo. Disabled by default so
+# force_bound_mg can be tested as a controller-design bound independently.
+disturbance_apply_enable: false
+disturbance_apply_only_circle: true
+disturbance_apply_force_bound_mg: 0.1  # <0 means reuse force_bound_mg
+disturbance_events_per_circle: 2  # short gusts per circular lap, near 1/4 and 3/4 lap
+disturbance_duration_sec: 0.5   # duration of each gust event
+# random: sample a bounded random force; fixed_ned: apply force_bound_mg along disturbance_force_direction_ned.
+disturbance_direction_mode: fixed_ned
+disturbance_force_direction_ned: [0.0, 1.0, 0.0]  # NED [n,e,d], used when mode=fixed_ned
+disturbance_seed: 1
+disturbance_body_name: iris::base_link
+disturbance_reference_frame: world
+disturbance_log_hz: 1.0
 
 # GP. Keep false until the no-GP full-reference RTMPC is stable in Gazebo.
 use_gp: false
@@ -46,8 +67,8 @@ thrust_to_dT_scale: -1.0
 # Output command slew-rate limit. u_* in CSV is the sent command; u_raw_* is before slew limiting.
 command_slew_enable: true
 max_dT_rate_nps: 10.0
-max_phi_rate_radps: 0.60
-max_theta_rate_radps: 0.60
+max_phi_rate_radps: 0.30
+max_theta_rate_radps: 0.30
 
 # Sign tuning
 state_roll_sign: 1.0
